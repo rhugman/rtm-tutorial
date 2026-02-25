@@ -20,5 +20,6 @@ dependencies:
       - -e ./dependencies/flopy
       - -e ./dependencies/pyemu
       - -e ./dependencies/mf6rtm
+      - -e ./dependencies/vorflow
       - pypestutils
       - vtk
