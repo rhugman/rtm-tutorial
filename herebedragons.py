@@ -100,6 +100,7 @@ def append_values_to_inner_lists(d, values, *, in_place=False, boundnme='wel'):
     return target
 
 def get_wel_coords(gwf, name  = "wellin"):
+    from flopy.utils.gridintersect import GridIntersect
     mg = gwf.modelgrid
     ix = GridIntersect(mg)
     wells = pd.read_csv(os.path.join("data", "wells.csv"))
@@ -123,6 +124,7 @@ def make_stress_period_data(coords, rates, add_conc=True):
         ]
 
 def make_obs_pack(gwf):
+    from flopy.utils.gridintersect import GridIntersect
     ix = GridIntersect(gwf.modelgrid)
     obsloc = pd.read_csv(os.path.join("data", "obs_loc.csv"))
 
@@ -316,7 +318,8 @@ def make_wel_opt(sim, conservative_tracer = None, mup3d_m=None, wellname = "well
     return wel_out
 
 def make_chd(gwf, conservative_tracer = None, mup3d_m=None):
-    
+    from pathlib import Path
+    from flopy.utils.gridintersect import GridIntersect
     l_hd= 0
     domain = gpd.read_file(Path('data', 'domain.gpkg'))
     geom = domain.dissolve().geometry[0]
@@ -522,7 +525,7 @@ def copy_parameterized_transport_files(ws=".",
 
     def flatten(xss):
         return [x for xs in xss for x in xs]
-    
+    from pathlib import Path
     sim = flopy.mf6.MFSimulation.load(sim_ws=ws, verbosity_level=0)
     species = sim.model_names[1:]
     species.remove(parameterized_species)
@@ -568,7 +571,8 @@ def node_to_layer_icell2d(nodes, ncpl):
     return layer0, icell2d0
 
 def process_sim_conc(wd='.'):
-
+    from flopy.utils.gridintersect import GridIntersect
+    from pathlib import Path
     sim = flopy.mf6.MFSimulation.load(sim_ws = wd,
                                     sim_name = 'gwf', 
                                     version='mf6',
