@@ -5,7 +5,6 @@ pyproject.toml
 setup.cfg
 setup.py
 mf6rtm/__init__.py
-mf6rtm/__main__.py
 mf6rtm/py.typed
 mf6rtm.egg-info/PKG-INFO
 mf6rtm.egg-info/SOURCES.txt

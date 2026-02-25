@@ -21,6 +21,7 @@ pyemu.egg-info/requires.txt
 pyemu.egg-info/top_level.txt
 pyemu/emulators/__init__.py
 pyemu/emulators/base.py
+pyemu/emulators/dpsi.py
 pyemu/emulators/dsi.py
 pyemu/emulators/dsiae.py
 pyemu/emulators/gpr.py

@@ -26,7 +26,6 @@ import pandas as pd
 
 from ..pyemu_warnings import PyemuWarning
 from ..pst import pst_handler
-from ..logger import Logger
 
 ext = ""
 bin_path = os.path.join("..", "bin")
@@ -142,9 +141,7 @@ def run_ossystem(cmd_str, cwd=".", verbose=False):
                 exe_name = exe_name.replace(".exe", "")
                 raw[0] = exe_name
                 cmd_str = "{0} {1} ".format(*raw)
-            if (os.path.exists(exe_name)
-                    and not exe_name.startswith("./")
-                    and not exe_name.startswith("/")):
+            if os.path.exists(exe_name) and not exe_name.startswith("./"):
                 cmd_str = "./" + cmd_str
 
     except Exception as e:
@@ -196,11 +193,8 @@ def run_sp(cmd_str, cwd=".", verbose=True, logfile=False, **kwargs):
 
     bwd = os.getcwd()
     os.chdir(cwd)
-    exe_name = cmd_str.split()[0]
-    if (platform.system() != "Windows"
-            and not shutil.which(exe_name)
-            and not exe_name.startswith("./")
-            and not exe_name.startswith("/")):
+
+    if platform.system() != "Windows" and not shutil.which(cmd_str.split()[0]):
         cmd_str = "./" + cmd_str
 
     try:
@@ -255,11 +249,11 @@ def _try_remove_existing(d, forgive=False):
 
 def _try_copy_dir(o_d, n_d):
     try:
-        shutil.copytree(o_d, n_d, symlinks=True)
+        shutil.copytree(o_d, n_d)
     except PermissionError:
         time.sleep(3) # pause for windows locking issues
         try:
-            shutil.copytree(o_d, n_d, symlinks=True)
+            shutil.copytree(o_d, n_d)
         except Exception as e:
             raise Exception(
                 f"unable to copy files from base dir: "
@@ -391,8 +385,7 @@ def start_workers(
             if not exe_rel_path.lower().endswith("exe"):
                 exe_rel_path = exe_rel_path + ".exe"
         else:
-            if (not exe_rel_path.startswith("./")
-                    and not exe_rel_path.startswith("/")):
+            if not exe_rel_path.startswith("./"):
                 exe_rel_path = "./" + exe_rel_path
 
     if master_dir is not None:
@@ -785,9 +778,6 @@ class PyPestWorker(object):
         self.socket_timeout = socket_timeout
         self.par_values = None
         self.max_reconnect_attempts = 10
-        self.logger_filename = "pypestworker_{0}.txt".format(datetime.now().strftime("%Y-%m-%d-%H-%M-%S-%f"))
-        self.logger = Logger(self.logger_filename,echo=verbose)
-        self.message("PyPestWorker starting with timeout:{0} and socket_timeout:{1}".format(self.timeout, self.socket_timeout))
         self._process_pst()
         self.connect()
         self._lock = threading.Lock()
@@ -797,7 +787,6 @@ class PyPestWorker(object):
 
 
     def _process_pst(self):
-        self.message("processing control file")
         if isinstance(self._pst_arg,str):
             self._pst = pst_handler.Pst(self._pst_arg)
         elif isinstance(self._pst_arg,pst_handler.Pst):
@@ -808,7 +797,7 @@ class PyPestWorker(object):
 
 
     def connect(self,is_reconnect=False):
-        self.message("trying to connect to {0}:{1}...".format(self.host,self.port))
+        self.message("trying to connect to {0}:{1}...".format(self.host,self.port),echo=True)
         self.s = None
         c = 0
         while True:
@@ -816,11 +805,11 @@ class PyPestWorker(object):
                 time.sleep(self.timeout)
                 c += 1
                 if is_reconnect and c > self.max_reconnect_attempts:
-                    self.message("max reconnect attempts reached...",True)
+                    print("max reconnect attempts reached...")
                     return False
                 self.s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
                 self.s.connect((self.host, self.port))
-                self.message("connected to {0}:{1}".format(self.host,self.port))
+                self.message("connected to {0}:{1}".format(self.host,self.port),echo=True)
                 break
 
             except ConnectionRefusedError:
@@ -833,7 +822,6 @@ class PyPestWorker(object):
 
 
     def message(self,msg,echo=False):
-        self.logger.statement(msg)
         if self.verbose or echo:
             print(str(datetime.now())+" : "+msg)
 
@@ -841,9 +829,7 @@ class PyPestWorker(object):
     def recv(self,dtype=None):
         n = self.net_pack.recv(self.s,dtype=dtype)
         if n > 0:
-            self.message("recv'd message type:{0}, group:{1}, run_id:{2}, desc:{3}"\
-                .format(NetPack.netpack_type[self.net_pack.mtype], 
-                    self.net_pack.group, self.net_pack.runid,self.net_pack.desc))
+            self.message("recv'd message type:{0}".format(NetPack.netpack_type[self.net_pack.mtype]))
         return n
 
 
@@ -851,10 +837,9 @@ class PyPestWorker(object):
         try:
             self.net_pack.send(self.s,mtype,group,runid,desc,data)
         except Exception as e:
-            self.message("WARNING: error sending message:{0}".format(str(e)), True)
+            print("WARNING: error sending message:{0}".format(str(e)))
             return False
-        self.message("sent message type:{0}, group: {1}, run_id:{2}, desc:{3}".\
-            format(NetPack.netpack_type[mtype], group, runid, desc))
+        self.message("sent message type:{0}".format(NetPack.netpack_type[mtype]))
         return True
 
     def listen(self,lock=None,send_lock=None):
@@ -865,10 +850,10 @@ class PyPestWorker(object):
             try:
                 n = self.recv()
             except Exception as e:
-                self.message("WARNING: recv exception:"+str(e)+"...trying to reconnect...", True)
+                print("WARNING: recv exception:"+str(e)+"...trying to reconnect...")
                 success = self.connect(is_reconnect=True)
                 if not success:
-                    self.message("...exiting")
+                    print("...exiting")
                     time.sleep(self.timeout)
                     # set the teminate flag so that the get_pars() look will exit
                     self._lock.acquire()
@@ -876,7 +861,7 @@ class PyPestWorker(object):
                     self._lock.release()
                     return
                 else:
-                    self.message("...reconnected successfully...", True)
+                    print("...reconnected successfully...")
                     continue
 
             if n > 0:
@@ -892,34 +877,26 @@ class PyPestWorker(object):
                 elif self.net_pack.mtype == 4:
                     if self._send_lock is not None:
                         self._send_lock.acquire()
-                    success = self.send(mtype=5, group=self.net_pack.group,
+                    self.send(mtype=5, group=self.net_pack.group,
                               runid=self.net_pack.runid,
                               desc="sending cwd", data=os.getcwd())
                     if self._send_lock is not None:
                         self._send_lock.release()
-                    if not success:
-                        self.message("failed cwd send...trying to reconnect...", True)
-                        success = self.connect(is_reconnect=True)
-                        if not success:
-                            self.message("...exiting", True)
-                            time.sleep(self.timeout)
-                            return
-                        else:
-                            self.message("reconnect successfully...", True)
-                            continue
 
                 elif self.net_pack.mtype == 8:
                     self.par_names = self.net_pack.data_pak
                     diff = set(self.par_names).symmetric_difference(set(self._pst.par_names))
                     if len(diff) > 0:
+                        print("WARNING: pst par names != master par names")
                         self.message("WARNING: the following par names are not common\n"+\
-                                    " between the control file and the master:{0}".format(','.join(diff)), True)
+                                    " between the control file and the master:{0}".format(','.join(diff)))
                 elif self.net_pack.mtype == 9:
                     self.obs_names = self.net_pack.data_pak
                     diff = set(self.obs_names).symmetric_difference(set(self._pst.obs_names))
                     if len(diff) > 0:
+                        print("WARNING: pst obs names != master obs names")
                         self.message("WARNING: the following obs names are not common\n"+\
-                                    " between the control file and the master:{0}".format(','.join(diff)), True)
+                                    " between the control file and the master:{0}".format(','.join(diff)))
 
                 elif self.net_pack.mtype == 6:
                     if self._send_lock is not None:
@@ -930,14 +907,14 @@ class PyPestWorker(object):
                     if self._send_lock is not None:
                         self._send_lock.release()
                     if not success:
-                        self.message("failed linpack send...trying to reconnect...", True)
+                        print("...trying to reconnect...")
                         success = self.connect(is_reconnect=True)
                         if not success:
-                            self.message("...exiting",True)
+                            print("...exiting")
                             time.sleep(self.timeout)
                             return
                         else:
-                            self.message("reconnect successfully...", True)
+                            print("reconnect successfully...")
                             continue
 
                 elif self.net_pack.mtype == 15:
@@ -949,23 +926,25 @@ class PyPestWorker(object):
                     if self._send_lock is not None:
                         self._send_lock.release()
                     if not success:
-                        self.message("failed ping back...trying to reconnect...", True)
+                        print("...trying to reconnect...")
                         success = self.connect(is_reconnect=True)
                         if not success:
-                            self.message("...exiting",True)
+                            print("...exiting")
                             time.sleep(self.timeout)
                             return
                         else:
-                            self.message("reconnect successfully...", True)
+                            print("reconnect successfully...")
                             continue
                 elif self.net_pack.mtype == 14:
-                    self.message("recv'd terminate signal", True)
+                    #print("recv'd terminate signal")
+                    self.message("recv'd terminate signal")
                     return
                 elif self.net_pack.mtype == 16:
-                    self.message("master is requesting run kill...", True)
+                    print("master is requesting run kill...")
+                    self.message("master is requesting run kill...")
 
                 else:
-                    self.message("WARNING: unsupported request received: {0}".format(NetPack.netpack_type[self.net_pack.mtype]), True)
+                    print("WARNING: unsupported request received: {0}".format(NetPack.netpack_type[self.net_pack.mtype]))
 
 
     def get_parameters(self):

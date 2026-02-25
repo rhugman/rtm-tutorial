@@ -275,6 +275,7 @@ def setup_pilotpoints_grid(
     defaults = pd.DataFrame(pst_config["par_defaults"], index=par_info.index)
     missingcols = defaults.columns.difference(par_info.columns)
     par_info.loc[:, missingcols] = defaults
+    print(par_info.dtypes)
 
     if shapename is not None:
         try:
@@ -288,26 +289,48 @@ def setup_pilotpoints_grid(
             shp = shapefile.Writer(target=shapename, shapeType=shapefile.POINT)
         except:
             shp = shapefile.Writer(shapeType=shapefile.POINT)
-        for name, dtype in par_info.dtypes.items():
-            if dtype == object:
-                shp.field(name, "C", size=50)
-            elif dtype in [int]:#, np.int64, np.int32]:
-                shp.field(name, "N", size=50, decimal=0)
-            elif dtype in [float, np.float32, np.float64]:
-                shp.field(name, "N", size=50, decimal=10)
-            else:
-                try:
-                    if dtype in [np.int64, np.int32]:
-                        shp.field(name, "N", size=50, decimal=0)
-                    else:
-                        raise Exception(
-                            "unrecognized field type in par_info:{0}:{1}".format(name, dtype)
-                        )
+        #for name, dtype in par_info.dtypes.items():
+        #    if dtype == object:
+        #        shp.field(name, "C", size=50)
+        #    elif dtype == str:
+        #        shp.field(name, "C", size=50)
+        #    elif dtype in [int]:#, np.int64, np.int32]:
+        #        shp.field(name, "N", size=50, decimal=0)
+        #    elif dtype in [float, np.float32, np.float64]:
+        #        shp.field(name, "N", size=50, decimal=10)
+        #    else:
+        #        print(name, dtype)
+        #        try:
+        #            if dtype in [np.int64, np.int32]:
+        #                shp.field(name, "N", size=50, decimal=0)
+        #            else:
+        #                raise Exception(
+        #                    "unrecognized field type in par_info:{0}:{1}".format(name, dtype)
+        #                )
+#
+        #        except Exception as e:
+        #            raise Exception(
+        #                "unrecognized field type in par_info:{0}:{1}".format(name, dtype)
+        #            )
+        import pandas.api.types as ptypes
 
-                except Exception as e:
-                    raise Exception(
-                        "unrecognized field type in par_info:{0}:{1}".format(name, dtype)
-                    )
+        for name, dtype in par_info.dtypes.items():
+            # Check for strings and objects
+            if ptypes.is_string_dtype(dtype) or ptypes.is_object_dtype(dtype):
+                shp.field(name, "C", size=50)
+                
+            # Check for any type of integer (int32, int64, etc.)
+            elif ptypes.is_integer_dtype(dtype):
+                shp.field(name, "N", size=50, decimal=0)
+                
+            # Check for any type of float (float32, float64, etc.)
+            elif ptypes.is_float_dtype(dtype):
+                shp.field(name, "N", size=50, decimal=10)
+                
+            # Catch anything else
+            else:
+                raise Exception(f"Unrecognized field type in par_info: {name} : {dtype}")
+
 
         # some pandas awesomeness..
         par_info.apply(lambda x: shp.point(x.x, x.y), axis=1)
@@ -783,10 +806,6 @@ def prep_pp_hyperpars(file_tag,pp_filename,pp_info,out_filename,grid_dict,
     aniso_filename = file_tag + ".aniso.dat"
     zone_filename = file_tag + ".zone.dat"
 
-    if len(arr_shape) == 1 and type(arr_shape) is tuple:
-        arr_shape = (1,arr_shape[0])
-
-
     nodes = list(grid_dict.keys())
     nodes.sort()
     with open(os.path.join(ws,gridinfo_filename), 'w') as f:
@@ -802,7 +821,7 @@ def prep_pp_hyperpars(file_tag,pp_filename,pp_info,out_filename,grid_dict,
     np.savetxt(os.path.join(ws,aniso_filename), aniso, fmt="%20.8E")
 
     if zone_array is None:
-        zone_array = np.ones(arr_shape,dtype=int)
+        zone_array = np.ones(shape,dtype=int)
     np.savetxt(os.path.join(ws,zone_filename),zone_array,fmt="%5d")
 
 

@@ -1,6 +1,6 @@
 Metadata-Version: 2.4
 Name: pyemu
-Version: 0+untagged.1.g6bf4576
+Version: 0+untagged.34.g7945894.dirty
 Summary: pyEMU is a set of python modules for interfacing with PEST and PEST++
 Author-email: Jeremy White <jtwhite1000@gmail.com>, Mike Fienen <mnfienen@usgs.gov>, Brioch Hemmings <b.hemmings@gns.cri.nz>
 License: BSD 3-Clause
