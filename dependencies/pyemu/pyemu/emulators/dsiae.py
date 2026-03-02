@@ -2,107 +2,123 @@
 Data Space Inversion (DSI) Autoencoder (AE) emulator implementation.
 """
 from __future__ import print_function, division
+from typing import Optional, List, Dict, Any, Union
 import numpy as np
 import pandas as pd
 import inspect
-from dependencies.pyemu import pyemu
-from pyemu.utils.helpers import dsi_forward_run, series_to_insfile
+from pyemu.utils.helpers import dsi_forward_run,dsi_runstore_forward_run, series_to_insfile
 import os
 import shutil
 from pyemu.pst.pst_handler import Pst
 from pyemu.en import ObservationEnsemble,ParameterEnsemble
 from .base import Emulator
-import tensorflow as tf
+from .dsi import DSI
+import pickle
+import tempfile
+import zipfile
+
+try:
+    import tensorflow as tf
+    from keras.saving import register_keras_serializable
+except ImportError:
+    tf = None
+    # Dummy decorator to prevent NameError on class definitions
+    def register_keras_serializable(package=None, name=None):
+        def decorator(cls):
+            return cls
+        return decorator
+
 from sklearn.model_selection import train_test_split
-import joblib
+
 
 
 class DSIAE(Emulator):
     """
-    Data Space Inversion (DSI) emulator class. Based on DSI as described in Sun &
-    Durlofsky (2017) and Sun et al (2017).
-        
+    Data Space Inversion Autoencoder (DSIAE) emulator.
     """
 
     def __init__(self, 
-                pst=None,
-                data=None,
-                transforms=None,
-                latent_dim=None,
-                energy_threshold=1.0,
-                verbose=False):
+                pst: Optional['Pst'] = None,
+                data: Optional[Union[pd.DataFrame, 'ObservationEnsemble']] = None,
+                transforms: Optional[List[Dict[str, Any]]] = None,
+                latent_dim: Optional[int] = None,
+                energy_threshold: float = 1.0,
+                verbose: bool = False) -> None:
         """
-        Initialize the DSI emulator.
+        Initialize the DSIAE emulator.
 
-        Parameters
-        ----------
-        pst : Pst, optional
-            A Pst object. If provided, the emulator will be initialized with the
-            information from the Pst object.
-        data : DataFrame or ObservationEnsemble, optional
-            An ensemble of simulated observations. If provided, the emulator will
-            be initialized with the information from the ensemble.
-        transforms : list of dict, optional
-            List of transformation specifications. Each dict should have:
-            - 'type': str - Type of transformation (e.g.,'log10', 'normal_score').
-            - 'columns': list of str,optional - Columns to apply the transformation to. If not supplied, transformation is applied to all columns.
-            - Additional kwargs for the transformation (e.g., 'quadratic_extrapolation' for normal score transform).
-            Example:
-            transforms = [
-                {'type': 'log10', 'columns': ['obs1', 'obs2']},
-                {'type': 'normal_score', 'quadratic_extrapolation': True}
-            ]
-            Default is None, which means no transformations will be applied.
-        energy_threshold : float, optional 
-            The energy threshold for the SVD. Default is 1.0, no truncation.
-        verbose : bool, optional
-            If True, enable verbose logging. Default is False.
+        Args:
+            pst: PEST control file object.
+            data: Training data (DataFrame or ObservationEnsemble).
+            transforms: List of dicts defining preprocessing transformations.
+            latent_dim: Latent space dimension. If None, determined from energy_threshold.
+            energy_threshold: Variance threshold for automatic latent dimension (0.0-1.0).
+            verbose: Enable verbose logging.
         """
-
         super().__init__(verbose=verbose)
 
         self.observation_data = pst.observation_data.copy() if pst is not None else None
-        #self.__org_parameter_data = pst.parameter_data.copy() if pst is not None else None
-        #self.__org_control_data = pst.control_data.copy() #breaks pickling
+        
         if isinstance(data, ObservationEnsemble):
             data = data._df.copy()
-        # set all data to be floats
-        data = data.astype(float) if data is not None else None
-        #self.__org_data = data.copy() if data is not None else None
-        self.data = data.copy() if data is not None else None
+        
+        # Ensure float data
+        self.data = data.astype(float).copy() if data is not None else None
+        
         self.energy_threshold = energy_threshold
-        assert isinstance(transforms, list) or transforms is None, "transforms must be a list of dicts or None"
+        
         if transforms is not None:
+            if not isinstance(transforms, list):
+                raise TypeError("transforms must be a list of dicts")
             for t in transforms:
-                assert isinstance(t, dict), "each transform must be a dict"
-                assert 'type' in t, "each transform dict must have a 'type' key"
+                if not isinstance(t, dict) or 'type' not in t:
+                    raise ValueError("Each transform must be a dict with a 'type' key")
                 if 'columns' in t:
-                    assert isinstance(t['columns'], list), "'columns' must be a list of column names"
-                    #all columns must be in the data
-                    assert all([col in self.data.columns for col in t['columns']]), "some columns in 'columns' are not in the data"
-                if t['type'] == 'normal_score':
-                    # check for quadratic_extrapolation
-                    if 'quadratic_extrapolation' in t:
-                        assert isinstance(t['quadratic_extrapolation'], bool), "'quadratic_extrapolation' must be a boolean"
+                    missing = [c for c in t['columns'] if c not in self.data.columns]
+                    if missing:
+                        raise ValueError(f"Transform columns not found in data: {missing}")
+
         self.transforms = transforms
-        self.latent_dim = latent_dim
         self.fitted = False
         self.data_transformed = self._prepare_training_data()
-        self.decision_variable_names = None #used for DSIVC
+        self.decision_variable_names = None 
+        self.latent_dim = latent_dim
         
-    def _prepare_training_data(self):
+        if self.latent_dim is None and self.data is not None:
+            self.logger.statement("calculating latent dimension from energy threshold")
+            self.latent_dim = self._calc_explained_variance()
+
+        
+    def _prepare_training_data(self) -> pd.DataFrame:
         """
         Prepare and transform training data for model fitting.
         
-        Parameters
-        ----------
-        self : DSI
-            The DSI emulator instance.
-            
+        This method applies the configured transformation pipeline to the raw training
+        data, preparing it for use in autoencoder training. If no transformations are
+        specified, the data is passed through unchanged but a dummy transformer is
+        still created for consistency in the prediction pipeline.
+        
         Returns
         -------
-        tuple
-            Processed data ready for model fitting.
+        pd.DataFrame
+            Transformed training data ready for model fitting. All values will be
+            numeric (float64) and any specified transformations will have been applied.
+            
+        Raises
+        ------
+        ValueError
+            If no data is stored in the emulator instance.
+            
+        Notes
+        -----
+        This method is automatically called during emulator initialization and stores
+        the transformed data in `self.data_transformed`. The transformation pipeline
+        is preserved in `self.transformer_pipeline` for use during prediction to
+        ensure consistent data preprocessing.
+        
+        The method always creates a transformer pipeline object, even when no 
+        transformations are specified, to maintain consistency in the prediction
+        workflow where inverse transformations may be needed.
         """
         data = self.data
         if data is None:
@@ -120,19 +136,56 @@ class DSIAE(Emulator):
     
         return self.data_transformed
         
-    def encode(self, X):
+    def encode(self, X: Union[np.ndarray, pd.DataFrame]) -> pd.DataFrame:
         """
-        Encode input data into latent space.
+        Encode input data into latent space representation.
+        
+        This method transforms input observation data into the lower-dimensional 
+        latent space learned by the autoencoder. The encoding process applies any
+        configured data transformations before passing the data through the encoder
+        network.
         
         Parameters
         ----------
-        X : numpy.ndarray
-            Input data to encode.
+        X : np.ndarray or pd.DataFrame
+            Input observation data to encode. Should have the same feature structure
+            as the training data. If DataFrame, the index will be preserved in the
+            output. Shape should be (n_samples, n_features) where n_features matches
+            the original observation space dimension.
             
         Returns
         -------
-        numpy.ndarray
-            Encoded latent representation.
+        pd.DataFrame
+            Encoded latent space representation with shape (n_samples, latent_dim).
+            If input was a DataFrame, the original index is preserved. Column names
+            will be generated automatically for the latent dimensions.
+            
+        Raises
+        ------
+        ValueError
+            If the encoder has not been fitted (emulator not trained).
+            If input data shape is incompatible with the trained model.
+            
+        Notes
+        -----
+        This method automatically applies the same data transformations that were
+        used during training, ensuring consistent preprocessing. The transformations
+        are applied via the stored `transformer_pipeline`.
+        
+        The latent space representation can be used for:
+        - Dimensionality reduction and visualization
+        - Parameter space exploration
+        - Input to optimization routines
+        - Analysis of model behavior in reduced space
+        
+        Examples
+        --------
+        >>> # Encode training data
+        >>> latent_repr = emulator.encode(training_data)
+        >>> 
+        >>> # Encode new observations
+        >>> new_latent = emulator.encode(new_observations)
+        >>> print(f"Latent dimensions: {new_latent.shape[1]}")
         """
         # check encoder exists
         if not hasattr(self, 'encoder'):
@@ -148,8 +201,21 @@ class DSIAE(Emulator):
         return Z
 
     
-    def _calc_explained_variance(self):
-
+    def _calc_explained_variance(self) -> int:
+        """
+        Calculate optimal latent dimension using PCA explained variance threshold.
+        
+        Returns
+        -------
+        int
+            Minimum latent dimensions to capture `energy_threshold` variance.
+            Falls back to full dimensionality if 99% variance threshold not reached.
+            
+        Notes
+        -----
+        Uses scikit-learn PCA on `self.data_transformed`. The energy_threshold 
+        represents cumulative explained variance ratio (e.g., 0.95 = 95% variance).
+        """
         from sklearn.decomposition import PCA  # light dependency; optional
         # PCA explained variance (optional)
         pca = PCA()
@@ -158,19 +224,45 @@ class DSIAE(Emulator):
         latent_dim = int(np.searchsorted(cum_explained, self.energy_threshold) + 1) if cum_explained[-1] >= 0.99 else len(cum_explained)
         return latent_dim
 
-    def fit(self,validation_split=0.1,hidden_dims=(128,64),lr=1e-3,epochs=300,batch_size=128,early_stopping=True,random_state=42):
+    def fit(self, validation_split: float = 0.1, hidden_dims: tuple = (128, 64), 
+            lr: float = 1e-3, epochs: int = 300, batch_size: int = 128, 
+            early_stopping: bool = True, dropout_rate: float = 0.0, 
+            random_state: int = 42, loss_type: str = 'energy', 
+            loss_kwargs: Optional[Dict[str, Any]] = None,
+            sample_weight: Optional[np.ndarray] = None) -> 'DSIAE':
         """
-        Fit the emulator to training data.
+        Fit the autoencoder emulator to training data.
         
         Parameters
         ----------
-        self : DSI
-            The DSI emulator instance.
+        validation_split : float, default 0.1
+            Fraction of data to use for validation.
+        hidden_dims : tuple, default (128, 64)
+            Hidden layer dimensions for encoder/decoder.
+        lr : float, default 1e-3
+            Learning rate for Adam optimizer.
+        epochs : int, default 300
+            Maximum training epochs.
+        batch_size : int, default 128
+            Training batch size.
+        early_stopping : bool, default True
+            Whether to use early stopping on validation loss.
+        dropout_rate : float, default 0.0
+            Dropout rate for regularization during training.
+        random_state : int, default 42
+            Random seed for reproducibility.
+        loss_type : str, default 'energy'
+            Type of loss function to use. Options: 'energy', 'mmd', 'wasserstein', 
+            'statistical', 'adaptive', 'mse', 'huber'.
+        loss_kwargs : dict, optional
+            Additional parameters for the loss function.
+        sample_weight : np.ndarray, optional
+            Sample weights for training. Shape should be (n_samples,).
             
         Returns
         -------
-        self : DSI
-            The fitted emulator.
+        DSIAE
+            Self (fitted emulator instance).
         """
         
         if self.data_transformed is None:
@@ -182,36 +274,70 @@ class DSIAE(Emulator):
             self.logger.statement("calculating latent dimension from energy threshold")
             self.latent_dim = self._calc_explained_variance()
 
-
+        # Configure loss function
+        if loss_kwargs is None:
+            loss_kwargs = {}
+        
+        # Set default loss parameters if not specified
+        if loss_type == 'energy' and 'lambda_energy' not in loss_kwargs:
+            loss_kwargs['lambda_energy'] = 1e-3
+        elif loss_type == 'mmd' and 'lambda_mmd' not in loss_kwargs:
+            loss_kwargs['lambda_mmd'] = 1e-3
+        elif loss_type == 'wasserstein' and 'lambda_w' not in loss_kwargs:
+            loss_kwargs['lambda_w'] = 1e-3
+        elif loss_type == 'statistical':
+            if 'lambda_moments' not in loss_kwargs:
+                loss_kwargs['lambda_moments'] = 1e-3
+            if 'lambda_corr' not in loss_kwargs:
+                loss_kwargs['lambda_corr'] = 5e-4
+            if 'lambda_dist' not in loss_kwargs:
+                loss_kwargs['lambda_dist'] = 1e-3
+        
+        loss_fn = create_distribution_loss(loss_type, **loss_kwargs)
+        
+        self.logger.statement(f"using {loss_type} loss function with parameters: {loss_kwargs}")
         # train autoencoder on transformed data
         ae = AutoEncoder(input_dim=X.shape[1], 
                         latent_dim=self.latent_dim,
                         hidden_dims=hidden_dims,
+                        loss=loss_fn,
                         lr=lr,
+                        dropout_rate=dropout_rate,
                         random_state=random_state,
                         )
         ae.fit(X,
                validation_split=validation_split,
                 epochs=epochs, batch_size=batch_size,
                 early_stopping=early_stopping,
+                patience=10,
+                sample_weight=sample_weight,
                 )
         self.encoder = ae
         self.fitted = True
         return self
     
-    def predict(self, pvals):
+    # Reuse implementation from DSI
+    _write_forward_run_script = DSI._write_forward_run_script
+
+    def predict(self, pvals: Union[np.ndarray, pd.Series, pd.DataFrame]) -> pd.Series:
         """
         Generate predictions from the emulator.
         
         Parameters
         ----------
-        pvals : numpy.ndarray or pandas.Series
-            Parameter values for prediction.
+        pvals : np.ndarray, pd.Series, or pd.DataFrame
+            Parameter values for prediction in latent space.
+            Shape should match latent_dim.
             
         Returns
         -------
-        pandas.Series
-            Predicted observation values.
+        pd.Series
+            Predicted observation values in original scale.
+            
+        Raises
+        ------
+        ValueError
+            If emulator not fitted or input dimensions incorrect.
         """
         if not self.fitted:
             raise ValueError("Emulator must be fitted before prediction")
@@ -220,12 +346,13 @@ class DSIAE(Emulator):
             raise ValueError("Emulator must be fitted and have valid transformations before prediction")
         
         if isinstance(pvals, pd.Series):
-            pvals = pvals.values.flatten().reshape(1,-1)
+            pvals = pvals.values.flatten().reshape(1,-1).astype(np.float32)
         elif isinstance(pvals, np.ndarray) and len(pvals.shape) == 2 and pvals.shape[0] == 1:
             pvals = pvals.flatten().reshape(1,-1)
+            pvals = pvals.astype(np.float32)
         elif isinstance(pvals, pd.DataFrame):
             index = pvals.index
-            pvals = pvals.values.astype(float)
+            pvals = pvals.values.astype(np.float32)
             
         #assert pvals.shape[0] == self.latent_dim , f"Input parameter dimension {pvals.shape[0]} does not match latent dimension {self.latent_dim}"
         sim_vals = self.encoder.decode(pvals)
@@ -248,164 +375,48 @@ class DSIAE(Emulator):
         #TODO
         return
         
-    def prepare_pestpp(self, t_d=None, observation_data=None):
-        """
-        Prepare PEST++ control files for the emulator.
+
         
-        Parameters
-        ----------
-        t_d : str, optional
-            Template directory path. Must be provided.
-        observation_data : pandas.DataFrame, optional
-            Observation data to use. If None, uses the data from initialization.
-            
-        Returns
-        -------
-        Pst
-            PEST++ control file object.
-        """
-        
-        assert t_d is not None, "template directory must be provided"
-        self.template_dir = t_d
-
-        if os.path.exists(t_d):
-            shutil.rmtree(t_d)
-        os.makedirs(t_d)
-        self.logger.statement("creating template directory {0}".format(t_d))
-
-        self.logger.log("creating tpl files")
-        dsi_in_file = os.path.join(t_d, "dsi_pars.csv")
-        dsi_tpl_file = dsi_in_file + ".tpl"
-        ftpl = open(dsi_tpl_file, 'w')
-        fin = open(dsi_in_file, 'w')
-        ftpl.write("ptf ~\n")
-        fin.write("parnme,parval1\n")
-        ftpl.write("parnme,parval1\n")
-        npar = self.latent_dim
-        assert npar>0, "no parameters found in the DSI emulator"
-        dsi_pnames = []
-        for i in range(npar):
-            pname = "dsi_par{0:04d}".format(i)
-            dsi_pnames.append(pname)
-            fin.write("{0},0.0\n".format(pname))
-            ftpl.write("{0},~   {0}   ~\n".format(pname, pname))
-        fin.close()
-        ftpl.close()
-        self.logger.log("creating tpl files")
-
-        # run once to get the dsi_pars.csv file
-        Z = self.encode(self.data)
-        if 'base' in Z.index:
-            pvals = Z.loc['base',:]
-        else:
-            pvals = Z.mean(axis=0) #TODO: the mean of the latent prior...doesnt realy mean anything hrere
-        sim_vals = self.predict(pvals)
-        
-        self.logger.log("creating ins file")
-        out_file = os.path.join(t_d,"dsi_sim_vals.csv")
-        sim_vals.to_csv(out_file,index=True)
-              
-        ins_file = out_file + ".ins"
-        sdf = pd.read_csv(out_file,index_col=0)
-        with open(ins_file,'w') as f:
-            f.write("pif ~\n")
-            f.write("l1\n")
-            for oname in sdf.index.values:
-                f.write("l1 ~,~ !{0}!\n".format(oname))
-        self.logger.log("creating ins file")
-
-        self.logger.log("creating Pst")
-        pst = Pst.from_io_files([dsi_tpl_file],[dsi_in_file],[ins_file],[out_file],pst_path=".")
-
-        par = pst.parameter_data
-        dsi_pars = par.loc[par.parnme.str.startswith("dsi_par"),"parnme"]
-        par.loc[dsi_pars,"parval1"] = pvals.values.flatten()
-        par.loc[dsi_pars,"parubnd"] = Z.max(axis=0).values
-        par.loc[dsi_pars,"parlbnd"] = Z.min(axis=0).values
-        par.loc[dsi_pars,"partrans"] = "none"
-
-        #with open(os.path.join(t_d,"dsi.unc"),'w') as f:
-        #    f.write("START STANDARD_DEVIATION\n")
-        #    for p in dsi_pars:
-        #        f.write("{0} 1.0\n".format(p))
-        #    f.write("END STANDARD_DEVIATION")
-        #pst.pestpp_options['parcov'] = "dsi.unc"
-        Z.columns = par.parnme.values
-        pe = pyemu.ParameterEnsemble(pst,Z)
-        pe.to_binary(os.path.join(t_d,'latent_prior.jcb'))
-        pst.pestpp_options['ies_parameter_ensemble'] = "latent_prior.jcb"
-
-        obs = pst.observation_data
-
-        if observation_data is not None:
-            self.observation_data = observation_data
-        else:
-            observation_data = self.observation_data
-        assert isinstance(observation_data, pd.DataFrame), "observation_data must be a pandas DataFrame"
-        for col in observation_data.columns:
-            obs.loc[sim_vals.index,col] = observation_data.loc[:,col]
-
-        # check if any observations are missing
-        missing_obs = list(set(obs.index) - set(observation_data.index))
-        assert len(missing_obs) == 0, "missing observations: {0}".format(missing_obs)
-
-        pst.control_data.noptmax = 0
-        pst.model_command = "python forward_run.py"
-        self.logger.log("creating Pst")
-
-
-        function_source = inspect.getsource(dsi_forward_run)
-        with open(os.path.join(t_d,"forward_run.py"),'w') as file:
-            file.write(function_source)
-            file.write("\n\n")
-            file.write("if __name__ == \"__main__\":\n")
-            file.write(f"    {function_source.split('(')[0].split('def ')[1]}()\n")
-        self.logger.log("creating Pst")
-
-        pst.pestpp_options["save_binary"] = True
-        pst.pestpp_options["overdue_giveup_fac"] = 1e30
-        pst.pestpp_options["overdue_giveup_minutes"] = 1e30
-        pst.pestpp_options["panther_agent_freeze_on_fail"] = True
-        pst.pestpp_options["ies_no_noise"] = False
-        pst.pestpp_options["ies_subset_size"] = -10 # the more the merrier
-        #pst.pestpp_options["ies_bad_phi_sigma"] = 2.0
-        #pst.pestpp_options["save_binary"] = True
-
-        pst.write(os.path.join(t_d,"dsi.pst"),version=2)
-        self.logger.statement("saved pst to {0}".format(os.path.join(t_d,"dsi.pst")))
-        
-        self.logger.statement("pickling dsi object to {0}".format(os.path.join(t_d,"dsi.pickle")))
-        self.save(os.path.join(t_d,"dsi.pickle"))
-        return pst
-        
-    def prepare_dsivc(self, decvar_names, t_d=None, pst=None, oe=None, track_stack=False, dsi_args=None, percentiles=[0.25,0.75,0.5], mou_population_size=None,ies_exe_path="pestpp-ies"):
+    def prepare_dsivc(self, decvar_names: Union[List[str], str], t_d: Optional[str] = None, 
+                      pst: Optional['Pst'] = None, oe: Optional['ObservationEnsemble'] = None, 
+                      track_stack: bool = False, dsi_args: Optional[Dict[str, Any]] = None, 
+                      percentiles: List[float] = [0.25, 0.75, 0.5], 
+                      mou_population_size: Optional[int] = None, 
+                      ies_exe_path: str = "pestpp-ies") -> 'Pst':
         """
         Prepare Data Space Inversion Variable Control (DSIVC) control files.
         
         Parameters
         ----------
         decvar_names : list or str
-            Names of decision variables.
+            Names of decision variables for optimization.
         t_d : str, optional
-            Template directory path.
+            Template directory path. Uses existing if None.
         pst : Pst, optional
-            PST control file object.
+            PST control file object. Uses existing if None.
         oe : ObservationEnsemble, optional
-            Observation ensemble.
-        track_stack : bool, optional
-            Whether to track the stack. Default is False.
+            Observation ensemble. Uses existing if None.
+        track_stack : bool, default False
+            Whether to include individual ensemble realizations as observations.
         dsi_args : dict, optional
-            Arguments for DSI.
-        percentiles : list, optional
-            Percentiles to calculate. Default is [0.25, 0.75, 0.5].
+            DSI configuration arguments.
+        percentiles : list, default [0.25, 0.75, 0.5]
+            Percentiles to calculate from ensemble statistics.
         mou_population_size : int, optional
             Population size for multi-objective optimization.
-        ies_exe_path : str, optional
-            Path to the PEST++ IES executable. Default is "pestpp-ies".
+        ies_exe_path : str, default "pestpp-ies"
+            Path to PEST++ IES executable.
+            
         Returns
         -------
         Pst
-            PEST++ control file object for DSIVC.
+            PEST++ control file object for DSIVC optimization.
+            
+        Notes
+        -----
+        Sets up multi-objective optimization with decision variables constrained
+        to training data bounds. Creates stack statistics observations for ensemble
+        matching and configures PEST++-MOU options.
         """
         # check that percentiles is a list or array of floats between 0 and 1.
         assert isinstance(percentiles, (list, np.ndarray)), "percentiles must be a list or array of floats"
@@ -608,19 +619,36 @@ class DSIAE(Emulator):
         self.logger.statement("DSIVC control files created...the user still needs to specify objectives and constraints...")
         return pst_dsivc
     
-    def hyperparam_search(
-        self,
-        latent_dims=None,
-        latent_dim_mults = [0.5, 1.0, 2.0],
-        hidden_dims_list=[(64,32),(128,64)],
-        lrs=[1e-2, 1e-3],
-        epochs=50,
-        batch_size=32,
-        random_state=0
-    ):
+    def hyperparam_search(self, latent_dims: Optional[List[int]] = None,
+                          latent_dim_mults: List[float] = [0.5, 1.0, 2.0],
+                          hidden_dims_list: List[tuple] = [(64, 32), (128, 64)],
+                          lrs: List[float] = [1e-2, 1e-3],
+                          epochs: int = 50, batch_size: int = 32,
+                          random_state: int = 0) -> Dict[tuple, float]:
         """
-        Simple grid search over AE hyperparameters.
-        Returns: dict of results {params: val_loss}
+        Grid search over autoencoder hyperparameters.
+        
+        Parameters
+        ----------
+        latent_dims : list of int, optional
+            Latent dimensions to test. If None, uses latent_dim_mults.
+        latent_dim_mults : list of float, default [0.5, 1.0, 2.0]
+            Multipliers for current latent_dim if latent_dims not provided.
+        hidden_dims_list : list of tuple, default [(64, 32), (128, 64)]
+            Hidden layer architectures to test.
+        lrs : list of float, default [1e-2, 1e-3]
+            Learning rates to test.
+        epochs : int, default 50
+            Training epochs for each configuration.
+        batch_size : int, default 32
+            Training batch size.
+        random_state : int, default 0
+            Random seed for reproducibility.
+            
+        Returns
+        -------
+        dict
+            Mapping from (latent_dim, hidden_dims, lr) to validation loss.
         """
         if latent_dims is None:
             assert self.latent_dim is not None, "Either latent_dims or self.latent_dim must be set"
@@ -638,36 +666,213 @@ class DSIAE(Emulator):
         )
         return results
 
+    def save(self, filename: str) -> None:
+        """
+        Save the emulator to a file.
+        
+        Bundles the pickled object and the TensorFlow model into a zip archive.
+        """
+        # Create a temporary directory to save components
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            # 1. Save TF model
+            model_dir = os.path.join(tmp_dir, "tf_model")
+            if hasattr(self, 'encoder') and self.encoder is not None:
+                self.encoder.save(model_dir)
+            
+            # 2. Remove TF model from self to allow pickling
+            encoder_ref = self.encoder
+            self.encoder = None
+            
+            # 3. Pickle the rest of the object
+            pkl_path = os.path.join(tmp_dir, "dsiae.pkl")
+            with open(pkl_path, "wb") as f:
+                pickle.dump(self, f)
+            
+            # Restore encoder
+            self.encoder = encoder_ref
+            
+            # 4. Zip everything into the target filename
+            with zipfile.ZipFile(filename, 'w', zipfile.ZIP_DEFLATED) as zipf:
+                # Add pickle
+                zipf.write(pkl_path, arcname="dsiae.pkl")
+                # Add TF model directory contents
+                if os.path.exists(model_dir):
+                    for root, dirs, files in os.walk(model_dir):
+                        for file in files:
+                            file_path = os.path.join(root, file)
+                            arcname = os.path.relpath(file_path, tmp_dir)
+                            zipf.write(file_path, arcname=arcname)
+        
+        print(f"Saved emulator to {filename}")
 
+    @classmethod
+    def load(cls, filename: str) -> 'DSIAE':
+        """
+        Load the emulator from a file.
+        """
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            with zipfile.ZipFile(filename, 'r') as zipf:
+                zipf.extractall(tmp_dir)
+            
+            # 1. Unpickle
+            with open(os.path.join(tmp_dir, "dsiae.pkl"), "rb") as f:
+                obj = pickle.load(f)
+            
+            # 2. Reload TF model if it exists
+            model_dir = os.path.join(tmp_dir, "tf_model")
+            if os.path.exists(model_dir):
+                # We need to reconstruct the AutoEncoder wrapper
+                # Since we don't have the init params easily available, we rely on the fact
+                # that AutoEncoder.load loads the Keras models directly.
+                # But we need an AutoEncoder instance first.
+                
+                # We can create a dummy AutoEncoder instance and then load the weights/models
+                # However, AutoEncoder.__init__ builds the model.
+                # We can bypass __init__ or use default params if we are just going to overwrite the models.
+                
+                # Better approach: The AutoEncoder class should have a classmethod to load from disk
+                # or we instantiate it with dummy params and then load.
+                
+                # Let's assume we can instantiate it with minimal params.
+                # We need input_dim and latent_dim.
+                # obj.data_transformed should be available.
+                input_dim = obj.data_transformed.shape[1] if obj.data_transformed is not None else 0
+                latent_dim = obj.latent_dim if obj.latent_dim is not None else 2
+                
+                # Create a blank AutoEncoder instance
+                # We use __new__ to bypass __init__ since we are loading the full model structure
+                ae = AutoEncoder.__new__(AutoEncoder)
+                ae.load(model_dir)
+                obj.encoder = ae
+            
+            return obj
+
+    def _get_emulator_parameters(self, pst=None):
+        """
+        Get params for DSIAE (latent variables).
+        """
+        Z = self.encode(self.data)
+        if 'base' in Z.index:
+            pvals = Z.loc['base',:]
+        else:
+            pvals = Z.mean(axis=0)
+            
+        npar = self.latent_dim
+        par_names = [f"dsi_par{i:04d}" for i in range(npar)]
+        
+        df = pd.DataFrame(index=par_names)
+        df["parnme"] = par_names
+        df["parval1"] = pvals.values.flatten()
+        df["parlbnd"] = Z.min(axis=0).values
+        df["parubnd"] = Z.max(axis=0).values
+        df["pargp"] = "dsi_pars"
+        df["partrans"] = "none"
+        
+        return df
+
+    def _get_emulator_observations(self, pst=None):
+        """
+        Get observations for DSIAE.
+        """
+        # Use columns from data (assuming they represent observations)
+        if self.data is not None:
+            cols = self.data.columns
+            df = pd.DataFrame(index=cols)
+            df["obsnme"] = cols
+            df["obsval"] = self.data.mean(axis=0) # Use mean as dummy value
+            df["weight"] = 0.0
+            df["obgnme"] = "obgnme"
+            return df
+
+    def _configure_pst_object(self, pst_obj, pst_original, t_d=None):
+        """
+        Configure DSIAE specific PEST++ options and save dependent files.
+        """
+        if t_d is None:
+             t_d = "."
+
+        Z = self.encode(self.data)
+        npar = self.latent_dim
+        par_names = pst_obj.parameter_data.index.tolist()
+        assert npar == len(par_names), f"latent dim {npar} does not match number of parameters {len(par_names)}"
+        Z.columns = par_names
+        
+        pe = ParameterEnsemble(pst_obj, Z)
+        jcb_path = os.path.join(t_d, 'latent_prior.jcb')
+        pe.to_binary(jcb_path)
+        pst_obj.pestpp_options['ies_parameter_ensemble'] = 'latent_prior.jcb'
+
+        pst_obj.pestpp_options["save_binary"] = True
+        pst_obj.pestpp_options["overdue_giveup_fac"] = 1e30
+        pst_obj.pestpp_options["overdue_giveup_minutes"] = 1e30
+        pst_obj.pestpp_options["panther_agent_freeze_on_fail"] = True
+        pst_obj.pestpp_options["ies_no_noise"] = False
+        pst_obj.pestpp_options["ies_subset_size"] = -10
+        
+        # Save dsi.pickle for legacy forward run scripts (like runstor)
+        self.save(os.path.join(t_d, "dsi.pickle"))
+        
+        self.logger.statement(f"Saved latent_prior.jcb to {jcb_path}")
+        return pst_obj
+        
+    def prepare_pestpp(self, t_d, pst=None, verbose=False, use_runstor=False):
+        """
+        Prepare PEST++ interface for DSIAE.
+        Wraps base implementation.
+        """
+        self._use_runstor = use_runstor
+        pst_obj = super().prepare_pestpp(t_d=t_d, pst=pst, verbose=verbose,
+                                         tpl_filename="dsi_pars.csv.tpl",
+                                         input_filename="dsi_pars.csv",
+                                         ins_filename="dsi_sim_vals.csv.ins",
+                                         output_filename="dsi_sim_vals.csv")
+        
+        return pst_obj
+    
 class AutoEncoder:
-    def __init__(
-        self,
-        input_dim,
-        latent_dim=2,
-        hidden_dims=(128, 64),
-        lr=1e-3,
-        activation='relu',
-        loss='Huber',
-        random_state=0
-    ):
+    def __init__(self, input_dim: int, latent_dim: int = 2, 
+                 hidden_dims: tuple = (128, 64), lr: float = 1e-3,
+                 activation: str = 'relu', loss: str = 'Huber', 
+                 dropout_rate: float = 0.0, random_state: int = 0) -> None:
+        """
+        Initialize AutoEncoder.
+
+        Args:
+            input_dim: Input feature dimension.
+            latent_dim: Latent space dimension.
+            hidden_dims: Tuple of hidden layer sizes for encoder (reversed for decoder).
+            lr: Learning rate.
+            activation: Activation function name.
+            loss: Loss function name.
+            dropout_rate: Dropout rate (0.0-1.0).
+            random_state: Random seed.
+        """
+        if tf is None:
+            raise ImportError("TensorFlow is required for AutoEncoder but not installed.")
+
         self.input_dim = input_dim
         self.latent_dim = latent_dim
         self.hidden_dims = hidden_dims
         self.lr = lr
         self.activation = activation
         self.loss = loss
+        self.dropout_rate = dropout_rate
         self.random_state = random_state
+        
+        tf.random.set_seed(random_state)
+        np.random.seed(random_state)
         self._build_model()
 
-    # -----------------------
     # Build encoder/decoder
-    # -----------------------
     def _build_model(self):
+        tf.keras.backend.set_floatx('float32')
         # Encoder
         encoder_inputs = tf.keras.Input(shape=(self.input_dim,))
         x = encoder_inputs
         for h in self.hidden_dims:
             x = tf.keras.layers.Dense(h, activation=self.activation)(x)
+            if hasattr(self, 'dropout_rate') and self.dropout_rate > 0:
+                x = tf.keras.layers.Dropout(self.dropout_rate)(x)
         latent = tf.keras.layers.Dense(self.latent_dim, name='latent')(x)
         self.encoder = tf.keras.Model(encoder_inputs, latent, name='encoder')
 
@@ -676,6 +881,8 @@ class AutoEncoder:
         x = decoder_inputs
         for h in reversed(self.hidden_dims):
             x = tf.keras.layers.Dense(h, activation=self.activation)(x)
+            if hasattr(self, 'dropout_rate') and self.dropout_rate > 0:
+                x = tf.keras.layers.Dropout(self.dropout_rate)(x)
         outputs = tf.keras.layers.Dense(self.input_dim, activation=None)(x)
         self.decoder = tf.keras.Model(decoder_inputs, outputs, name='decoder')
 
@@ -685,23 +892,32 @@ class AutoEncoder:
         self.model = tf.keras.Model(ae_inputs, ae_outputs, name='autoencoder')
         self.model.compile(optimizer=tf.keras.optimizers.Adam(self.lr), loss=self.loss)
 
-    # -----------------------
-    # Fit with improved control
-    # -----------------------
-    def fit(
-        self,
-        X,
-        X_val=None,
-        epochs=100,
-        batch_size=32,
-        validation_split=0.1,
-        early_stopping=True,
-        patience=10,
-        lr_schedule=None,
-        verbose=2
-    ):
 
+    def fit(self, X: np.ndarray, X_val: Optional[np.ndarray] = None, 
+            epochs: int = 100, batch_size: int = 32, 
+            validation_split: float = 0.1, early_stopping: bool = True,
+            patience: int = 10, lr_schedule: Optional[Any] = None, 
+            verbose: int = 2, sample_weight: Optional[np.ndarray] = None,
+            validation_sample_weight: Optional[np.ndarray] = None) -> Any:
+        """
+        Train the autoencoder.
 
+        Args:
+            X: Training data.
+            X_val: Validation data (optional).
+            epochs: Max epochs.
+            batch_size: Batch size.
+            validation_split: Validation split fraction (if X_val is None).
+            early_stopping: Enable early stopping.
+            patience: Early stopping patience.
+            lr_schedule: Learning rate scheduler callback.
+            verbose: Verbosity level.
+            sample_weight: Training sample weights.
+            validation_sample_weight: Validation sample weights.
+
+        Returns:
+            Training history.
+        """
         # Callbacks
         callbacks = []
         if early_stopping:
@@ -713,11 +929,12 @@ class AutoEncoder:
         if lr_schedule is not None:
             callbacks.append(lr_schedule)
 
+
         # Train
         history = self.model.fit(
             X, X,
-            validation_data=(X_val, X_val) if X_val is not None else None,
-            validation_split=validation_split if X_val is None else 0.0,
+            sample_weight=sample_weight,
+            validation_split=validation_split,
             epochs=epochs,
             batch_size=batch_size,
             callbacks=callbacks,
@@ -725,55 +942,115 @@ class AutoEncoder:
         )
         return history
 
-    # -----------------------
-    # Encode / Decode
-    # -----------------------
-    def encode(self, X):
+    def encode(self, X: Union[np.ndarray, pd.DataFrame, pd.Series]) -> np.ndarray:
+        """
+        Encode input data to latent representation.
+        
+        Parameters
+        ----------
+        X : np.ndarray, pd.DataFrame, or pd.Series
+            Input data to encode to latent space.
+            
+        Returns
+        -------
+        np.ndarray
+            Latent representation with shape (n_samples, latent_dim).
+        """
         if isinstance(X, pd.DataFrame):
-            X = X.values.astype(float)
+            X = X.values.astype(np.float32)
         elif isinstance(X, pd.Series):
-            X = X.values.reshape(1,-1).astype(float)
-        return self.encoder.predict(X, verbose=0)
+            X = X.values.reshape(1,-1).astype(np.float32)
+        return self.encoder(X, training=False)
 
-    def decode(self, Z):
-        X_hat = self.decoder.predict(Z, verbose=0)
+    def decode(self, Z: np.ndarray) -> np.ndarray:
+        """
+        Decode latent representation back to input space.
+        
+        Parameters
+        ----------
+        Z : np.ndarray
+            Latent representation with shape (n_samples, latent_dim).
+            
+        Returns
+        -------
+        np.ndarray
+            Reconstructed data with shape (n_samples, input_dim).
+        """
+        #X_hat = self.decoder.predict(Z, verbose=0,)
+        X_hat = self.decoder(Z,training=False)
         return X_hat
 
 
-    # -----------------------
-    # Save / Load
-    # -----------------------
-    def save(self, folder):
-        os.makedirs(folder, exist_ok=True)
-        self.encoder.save(os.path.join(folder, 'encoder'))
-        self.decoder.save(os.path.join(folder, 'decoder'))
-        self.model.save(os.path.join(folder, 'autoencoder'))
-        if self.scaler:
-            joblib.dump(self.scaler, os.path.join(folder, 'scaler.pkl'))
-
-    def load(self, folder):
-        self.encoder = tf.keras.models.load_model(os.path.join(folder, 'encoder'))
-        self.decoder = tf.keras.models.load_model(os.path.join(folder, 'decoder'))
-        self.model = tf.keras.models.load_model(os.path.join(folder, 'autoencoder'))
-        if self.use_scaler:
-            self.scaler = joblib.load(os.path.join(folder, 'scaler.pkl'))
-
-    # -----------------------
-    # Hyperparameter search helper
-    # -----------------------
-    @staticmethod
-    def hyperparam_search(
-        X,
-        latent_dims=[2,3,5],
-        hidden_dims_list=[(64,32),(128,64)],
-        lrs=[1e-2, 1e-3],
-        epochs=50,
-        batch_size=32,
-        random_state=42
-    ):
+    def save(self, folder: str) -> None:
         """
-        Simple grid search over AE hyperparameters.
-        Returns: dict of results {params: val_loss}
+        Save trained models to disk.
+        """
+        os.makedirs(folder, exist_ok=True)
+        self.encoder.save(os.path.join(folder, 'encoder.keras'))
+        self.decoder.save(os.path.join(folder, 'decoder.keras'))
+        self.model.save(os.path.join(folder, 'autoencoder.keras'))
+
+    def load(self, folder: str) -> None:
+        """
+        Load trained models from disk.
+        """
+        self.encoder = tf.keras.models.load_model(os.path.join(folder, 'encoder.keras'))
+        self.decoder = tf.keras.models.load_model(os.path.join(folder, 'decoder.keras'))
+        self.model = tf.keras.models.load_model(os.path.join(folder, 'autoencoder.keras'))
+
+
+    @staticmethod
+    def hyperparam_search(X: np.ndarray, latent_dims: List[int] = [2, 3, 5],
+                          hidden_dims_list: List[tuple] = [(64, 32), (128, 64)],
+                          lrs: List[float] = [1e-2, 1e-3], epochs: int = 50,
+                          batch_size: int = 32, random_state: int = 42) -> Dict[tuple, float]:
+        """
+        Perform grid search over autoencoder hyperparameters.
+        
+        Systematically evaluates different combinations of latent dimensions,
+        network architectures, and learning rates to find optimal configurations
+        based on validation loss performance.
+        
+        Parameters
+        ----------
+        X : np.ndarray
+            Training data for hyperparameter optimization.
+            
+        latent_dims : list of int, default [2, 3, 5]
+            Latent space dimensions to evaluate.
+            
+        hidden_dims_list : list of tuple, default [(64, 32), (128, 64)]
+            Network architectures to test. Each tuple specifies hidden layer sizes.
+            
+        lrs : list of float, default [1e-2, 1e-3]
+            Learning rates to evaluate.
+            
+        epochs : int, default 50
+            Training epochs for each configuration.
+            
+        batch_size : int, default 32
+            Batch size for training.
+            
+        random_state : int, default 42
+            Random seed for reproducible train/validation splits.
+            
+        Returns
+        -------
+        dict
+            Mapping from (latent_dim, hidden_dims, lr) tuples to validation loss values.
+            Lower values indicate better performance.
+            
+        Notes
+        -----
+        Uses 10% of data for validation via train_test_split. Each configuration
+        is trained independently with early stopping disabled to ensure fair
+        comparison across hyperparameter combinations.
+        
+        Examples
+        --------
+        >>> results = AutoEncoder.hyperparam_search(X_train, epochs=100)
+        >>> best_params = min(results.keys(), key=results.get)
+        >>> print(f"Best configuration: {best_params}")
         """
         results = {}
         X_train, X_val = train_test_split(X, test_size=0.1, random_state=random_state)
@@ -782,8 +1059,516 @@ class AutoEncoder:
                 for lr in lrs:
                     print(f"Training AE: latent_dim={ld}, hidden_dims={hd}, lr={lr}")
                     ae = AutoEncoder(input_dim=X.shape[1], latent_dim=ld, hidden_dims=hd, lr=lr)
-                    history = ae.fit(X_train, X_val=X_val, epochs=epochs, verbose=0)
+                    history = ae.fit(X_train, X_val=X_val, epochs=epochs, batch_size=batch_size,verbose=0)
                     val_loss = history.history['val_loss'][-1]
                     results[(ld, hd, lr)] = val_loss
                     print(f"Validation loss: {val_loss:.4f}")
         return results
+    
+
+
+
+# Efficient pairwise L2 distances
+def pairwise_distances(x, y, eps=1e-12):
+    x_norm = tf.reduce_sum(tf.square(x), axis=1, keepdims=True)
+    y_norm = tf.reduce_sum(tf.square(y), axis=1, keepdims=True)
+    dist_sq = x_norm + tf.transpose(y_norm) - 2.0 * tf.matmul(x, y, transpose_b=True)
+    dist_sq = tf.maximum(dist_sq, eps)
+    return tf.sqrt(dist_sq)
+
+
+
+# Energy distance core function
+def energy_distance_optimized(y_true, y_pred):
+    d_xy = pairwise_distances(y_true, y_pred)
+    cross = 2.0 * tf.reduce_mean(d_xy)
+
+    d_xx = pairwise_distances(y_true, y_true)
+    d_yy = pairwise_distances(y_pred, y_pred)
+
+    return cross - tf.reduce_mean(d_xx) - tf.reduce_mean(d_yy)
+
+
+# UTILITY FUNCTIONS FOR DISTRIBUTION-AWARE LOSSES
+def maximum_mean_discrepancy(x, y, kernel='rbf', sigma=1.0):
+    """Compute Maximum Mean Discrepancy between two distributions."""
+    if kernel == 'rbf':
+        # RBF kernel k(x,y) = exp(-||x-y||^2 / (2*sigma^2))
+        x_norm = tf.reduce_sum(tf.square(x), axis=1, keepdims=True)
+        y_norm = tf.reduce_sum(tf.square(y), axis=1, keepdims=True)
+        
+        # Pairwise distances
+        xx = x_norm + tf.transpose(x_norm) - 2.0 * tf.matmul(x, x, transpose_b=True)
+        yy = y_norm + tf.transpose(y_norm) - 2.0 * tf.matmul(y, y, transpose_b=True)
+        xy = x_norm + tf.transpose(y_norm) - 2.0 * tf.matmul(x, y, transpose_b=True)
+        
+        # Apply RBF kernel
+        k_xx = tf.exp(-xx / (2 * sigma**2))
+        k_yy = tf.exp(-yy / (2 * sigma**2))
+        k_xy = tf.exp(-xy / (2 * sigma**2))
+        
+    elif kernel == 'linear':
+        k_xx = tf.matmul(x, x, transpose_b=True)
+        k_yy = tf.matmul(y, y, transpose_b=True)
+        k_xy = tf.matmul(x, y, transpose_b=True)
+    else:
+        raise ValueError(f"Unsupported kernel: {kernel}")
+    
+    # MMD calculation
+    mmd = tf.reduce_mean(k_xx) + tf.reduce_mean(k_yy) - 2.0 * tf.reduce_mean(k_xy)
+    return tf.maximum(mmd, 0.0)  # Ensure non-negative
+
+
+def wasserstein_distance_sliced(x, y, num_projections=50):
+    """Approximate Wasserstein-1 distance using sliced Wasserstein distance."""
+    # Generate random projections
+    d = tf.shape(x)[1]
+    theta = tf.random.normal([d, num_projections])
+    theta = theta / tf.norm(theta, axis=0, keepdims=True)
+    
+    # Project data onto random directions
+    x_proj = tf.matmul(x, theta)  # [batch_size, num_projections]
+    y_proj = tf.matmul(y, theta)  # [batch_size, num_projections]
+    
+    # Sort projections
+    x_sorted = tf.sort(x_proj, axis=0)
+    y_sorted = tf.sort(y_proj, axis=0)
+    
+    # Compute L1 distance between sorted projections
+    distances = tf.reduce_mean(tf.abs(x_sorted - y_sorted), axis=0)
+    return tf.reduce_mean(distances)
+
+
+def correlation_loss(x, y):
+    """Penalize differences in correlation structure between datasets."""
+    # Center the data
+    x_centered = x - tf.reduce_mean(x, axis=0, keepdims=True)
+    y_centered = y - tf.reduce_mean(y, axis=0, keepdims=True)
+    
+    # Compute correlation matrices
+    x_cov = tf.matmul(x_centered, x_centered, transpose_a=True) / tf.cast(tf.shape(x)[0] - 1, tf.float32)
+    y_cov = tf.matmul(y_centered, y_centered, transpose_a=True) / tf.cast(tf.shape(y)[0] - 1, tf.float32)
+    
+    # Normalize to get correlation
+    x_std = tf.sqrt(tf.diag_part(x_cov))
+    y_std = tf.sqrt(tf.diag_part(y_cov))
+    
+    x_corr = x_cov / (tf.expand_dims(x_std, 0) * tf.expand_dims(x_std, 1))
+    y_corr = y_cov / (tf.expand_dims(y_std, 0) * tf.expand_dims(y_std, 1))
+    
+    # Frobenius norm of difference
+    return tf.reduce_mean(tf.square(x_corr - y_corr))
+
+
+
+if tf is not None:
+    LossBase = tf.keras.losses.Loss
+else:
+    class LossBase:
+        def __init__(self, name=None, **kwargs):
+            pass
+        def __call__(self, *args, **kwargs):
+            pass
+
+@register_keras_serializable(package="pyemu_emulators", name="EnergyLoss")
+class EnergyLoss(LossBase):
+    """
+    Energy distance loss combining MSE reconstruction with energy distance.
+    
+    The energy distance measures dissimilarity between probability distributions
+    and helps ensure the reconstructed samples preserve the overall data distribution.
+    """
+
+    def __init__(self, lambda_energy=1e-2, name="energy_loss"):
+        super().__init__(name=name)
+        self.lambda_energy = lambda_energy
+
+    def call(self, y_true, y_pred):
+        mse = tf.reduce_mean(tf.square(y_true - y_pred))
+        ed = energy_distance_optimized(y_true, y_pred)
+        return mse + self.lambda_energy * ed
+
+    def get_config(self):
+        return {
+            "lambda_energy": self.lambda_energy,
+            "name": self.name,
+        }
+
+    @classmethod
+    def from_config(cls, config):
+        return cls(**config)
+
+
+@register_keras_serializable(package="pyemu_emulators", name="MMDLoss")
+class MMDLoss(LossBase):
+    """
+    Maximum Mean Discrepancy loss for distribution matching.
+    
+    MMD measures the distance between distributions in a reproducing kernel
+    Hilbert space. More computationally efficient than energy distance.
+    """
+
+    def __init__(self, lambda_mmd=1e-2, kernel='rbf', sigma=1.0, name="mmd_loss"):
+        super().__init__(name=name)
+        self.lambda_mmd = lambda_mmd
+        self.kernel = kernel
+        self.sigma = sigma
+
+    def call(self, y_true, y_pred):
+        mse = tf.reduce_mean(tf.square(y_true - y_pred))
+        mmd = maximum_mean_discrepancy(y_true, y_pred, kernel=self.kernel, sigma=self.sigma)
+        return mse + self.lambda_mmd * mmd
+
+    def get_config(self):
+        return {
+            "lambda_mmd": self.lambda_mmd,
+            "kernel": self.kernel,
+            "sigma": self.sigma,
+            "name": self.name,
+        }
+
+    @classmethod
+    def from_config(cls, config):
+        return cls(**config)
+
+
+@register_keras_serializable(package="pyemu_emulators", name="WassersteinLoss")
+class WassersteinLoss(LossBase):
+    """
+    Sliced Wasserstein distance loss for distribution matching.
+    
+    Uses random projections to approximate the Wasserstein-1 distance,
+    which is particularly effective for high-dimensional distributions.
+    """
+
+    def __init__(self, lambda_w=1e-2, num_projections=50, name="wasserstein_loss"):
+        super().__init__(name=name)
+        self.lambda_w = lambda_w
+        self.num_projections = num_projections
+
+    def call(self, y_true, y_pred):
+        mse = tf.reduce_mean(tf.square(y_true - y_pred))
+        w_dist = wasserstein_distance_sliced(y_true, y_pred, self.num_projections)
+        return mse + self.lambda_w * w_dist
+
+    def get_config(self):
+        return {
+            "lambda_w": self.lambda_w,
+            "num_projections": self.num_projections,
+            "name": self.name,
+        }
+
+    @classmethod
+    def from_config(cls, config):
+        return cls(**config)
+
+
+@register_keras_serializable(package="pyemu_emulators", name="StatisticalLoss")
+class StatisticalLoss(LossBase):
+    """
+    Multi-component statistical loss for comprehensive distribution matching.
+    
+    Combines reconstruction error with multiple statistical measures:
+    - Moment matching (mean, variance, skewness, kurtosis)
+    - Correlation structure preservation
+    - Optional distribution distance (MMD or Energy)
+    """
+
+    def __init__(self, lambda_moments=1e-2, lambda_corr=1e-3, lambda_dist=1e-3,
+                 dist_type='mmd', mmd_sigma=1.0, name="statistical_loss"):
+        super().__init__(name=name)
+        self.lambda_moments = lambda_moments
+        self.lambda_corr = lambda_corr
+        self.lambda_dist = lambda_dist
+        self.dist_type = dist_type
+        self.mmd_sigma = mmd_sigma
+
+    def call(self, y_true, y_pred):
+        # Reconstruction loss
+        mse = tf.reduce_mean(tf.square(y_true - y_pred))
+        
+        # Moment matching
+        moments_loss = 0.0
+        for moment in range(1, 5):  # mean, variance, skewness, kurtosis
+            true_moment = tf.reduce_mean(tf.pow(y_true - tf.reduce_mean(y_true, axis=0), moment), axis=0)
+            pred_moment = tf.reduce_mean(tf.pow(y_pred - tf.reduce_mean(y_pred, axis=0), moment), axis=0)
+            moments_loss += tf.reduce_mean(tf.square(true_moment - pred_moment))
+        
+        # Correlation structure loss
+        corr_loss = correlation_loss(y_true, y_pred)
+        
+        # Distribution distance
+        if self.dist_type == 'mmd':
+            dist_loss = maximum_mean_discrepancy(y_true, y_pred, sigma=self.mmd_sigma)
+        elif self.dist_type == 'energy':
+            dist_loss = energy_distance_optimized(y_true, y_pred)
+        else:
+            dist_loss = 0.0
+        
+        total_loss = (mse + 
+                     self.lambda_moments * moments_loss + 
+                     self.lambda_corr * corr_loss + 
+                     self.lambda_dist * dist_loss)
+        
+        return total_loss
+
+    def get_config(self):
+        return {
+            "lambda_moments": self.lambda_moments,
+            "lambda_corr": self.lambda_corr,
+            "lambda_dist": self.lambda_dist,
+            "dist_type": self.dist_type,
+            "mmd_sigma": self.mmd_sigma,
+            "name": self.name,
+        }
+
+    @classmethod
+    def from_config(cls, config):
+        return cls(**config)
+
+
+@register_keras_serializable(package="pyemu_emulators", name="AdaptiveLoss")
+class AdaptiveLoss(LossBase):
+    """
+    Adaptive loss that balances reconstruction and distribution terms dynamically.
+    
+    Automatically adjusts the weighting between reconstruction and distribution
+    preservation based on their relative magnitudes during training.
+    """
+
+    def __init__(self, base_lambda=1e-2, adaptation_rate=0.01, min_lambda=1e-5, 
+                 max_lambda=1e-1, name="adaptive_loss"):
+        super().__init__(name=name)
+        self.base_lambda = base_lambda
+        self.adaptation_rate = adaptation_rate
+        self.min_lambda = min_lambda
+        self.max_lambda = max_lambda
+        self.current_lambda = tf.Variable(base_lambda, trainable=False, name="adaptive_lambda")
+
+    def call(self, y_true, y_pred):
+        mse = tf.reduce_mean(tf.square(y_true - y_pred))
+        ed = energy_distance_optimized(y_true, y_pred)
+        
+        # Adaptive weighting based on relative magnitudes
+        mse_magnitude = tf.stop_gradient(mse)
+        ed_magnitude = tf.stop_gradient(ed)
+        
+        # Update lambda to balance the terms
+        ratio = ed_magnitude / (mse_magnitude + 1e-8)
+        target_lambda = self.base_lambda * tf.clip_by_value(ratio, 0.1, 10.0)
+        
+        # Smooth update of lambda
+        self.current_lambda.assign(
+            self.current_lambda * (1 - self.adaptation_rate) + 
+            target_lambda * self.adaptation_rate
+        )
+        
+        # Clip lambda to reasonable bounds
+        clipped_lambda = tf.clip_by_value(self.current_lambda, self.min_lambda, self.max_lambda)
+        
+        return mse + clipped_lambda * ed
+
+    def get_config(self):
+        return {
+            "base_lambda": self.base_lambda,
+            "adaptation_rate": self.adaptation_rate,
+            "min_lambda": self.min_lambda,
+            "max_lambda": self.max_lambda,
+            "name": self.name,
+        }
+
+    @classmethod
+    def from_config(cls, config):
+        return cls(**config)
+
+
+@register_keras_serializable(package="custom_losses")
+class PerSampleMSE(LossBase):
+    def __init__(self, name="per_sample_mse"):
+        super().__init__(reduction="none", name=name)
+
+    def call(self, y_true, y_pred):
+        # shape (batch,)
+        return tf.reduce_mean(tf.square(y_true - y_pred), axis=1)
+
+
+    def get_config(self):
+        return {"name": self.name}
+
+    @classmethod
+    def from_config(cls, config):
+        return cls(**config)
+
+
+
+def create_observation_weights(data: Union[pd.DataFrame, np.ndarray], 
+                             observed_values: List[float], 
+                             critical_features: List[int],
+                             weight_type: str = 'inverse_distance',
+                             temperature: float = 1.0,
+                             normalize: bool = True,
+                             clip_range: tuple = (0.1, 10.0)) -> np.ndarray:
+    """
+    Create sample weights based on proximity to observed values.
+    
+    Parameters
+    ----------
+    data : pd.DataFrame or np.ndarray
+        Training data with shape (n_samples, n_features)
+    observed_values : list of float
+        Target observed values at critical features
+    critical_features : list of int
+        Column indices of critical observation features  
+    weight_type : str, default 'inverse_distance'
+        Type of weighting: 'inverse_distance', 'gaussian', 'exponential'
+    temperature : float, default 1.0
+        Temperature parameter for weight decay (lower = sharper weighting)
+    normalize : bool, default True
+        Whether to normalize weights to mean = 1.0
+    clip_range : tuple, default (0.1, 10.0)
+        Range to clip extreme weights (min, max)
+        
+    Returns
+    -------
+    np.ndarray
+        Sample weights with shape (n_samples,)
+    """
+    if isinstance(data, pd.DataFrame):
+        data = data.values
+    
+    observed_values = np.array(observed_values)
+    sample_weights = np.ones(len(data))
+    
+    for i in range(len(data)):
+        sample_values = data[i][critical_features]
+        
+        if weight_type == 'inverse_distance':
+            distance = np.sqrt(np.sum((sample_values - observed_values)**2))
+            weight = 1.0 / (1.0 + distance / temperature)
+            
+        elif weight_type == 'gaussian':
+            distance_sq = np.sum((sample_values - observed_values)**2)
+            weight = np.exp(-distance_sq / (2.0 * temperature**2))
+            
+        elif weight_type == 'exponential':
+            distance = np.sqrt(np.sum((sample_values - observed_values)**2))
+            weight = np.exp(-distance / temperature)
+            
+        else:
+            raise ValueError(f"Unknown weight_type: {weight_type}")
+            
+        sample_weights[i] = weight
+    
+    if normalize:
+        sample_weights = sample_weights / np.mean(sample_weights)
+    
+    if clip_range is not None:
+        sample_weights = np.clip(sample_weights, clip_range[0], clip_range[1])
+    
+    return sample_weights
+
+
+def create_pest_observation_weights(pst: 'Pst', 
+                                   emulator_data: pd.DataFrame,
+                                   weight_scaling: float = 1.0,
+                                   **kwargs) -> np.ndarray:
+    """
+    Create sample weights using PEST observation data.
+    
+    Parameters
+    ----------
+    pst : Pst
+        PEST control file object with observation data
+    emulator_data : pd.DataFrame
+        Training data for the emulator
+    weight_scaling : float, default 1.0
+        Overall scaling factor for weights
+    **kwargs
+        Additional arguments passed to create_observation_weights
+        
+    Returns
+    -------
+    np.ndarray
+        Sample weights based on PEST observations
+    """
+    obs_data = pst.observation_data
+    
+    # Map observation names to column indices
+    critical_features = []
+    observed_values = []
+    
+    for obs_name in obs_data.index:
+        if obs_name in emulator_data.columns:
+            col_idx = emulator_data.columns.get_loc(obs_name)
+            critical_features.append(col_idx)
+            observed_values.append(obs_data.loc[obs_name, 'obsval'])
+    
+    if len(critical_features) == 0:
+        raise ValueError("No matching observations found between PST and emulator data")
+    
+    weights = create_observation_weights(
+        emulator_data, observed_values, critical_features, **kwargs
+    )
+    
+    return weights * weight_scaling
+
+
+
+def create_distribution_loss(loss_type='energy', **kwargs):
+    """
+    Factory function to create distribution-aware loss functions.
+    
+    Parameters
+    ----------
+    loss_type : str
+        Type of loss function to create:
+        - 'energy': EnergyLoss (default, robust but computationally expensive)
+        - 'mmd': MMDLoss (efficient, good for high-dim data)
+        - 'wasserstein': WassersteinLoss (good for smooth distributions)
+        - 'statistical': StatisticalLoss (comprehensive statistical matching)
+        - 'adaptive': AdaptiveLoss (automatically balances terms)
+        - 'mse': Standard MSE (no distribution matching)
+        - 'huber': Huber loss (robust to outliers, no distribution matching)
+    **kwargs : dict
+        Additional parameters specific to each loss type
+        
+    Returns
+    -------
+    tf.keras.losses.Loss
+        Configured loss function
+        
+    Examples
+    --------
+    >>> # Energy loss with custom weighting
+    >>> loss = create_distribution_loss('energy', lambda_energy=1e-3)
+    >>> 
+    >>> # MMD loss with RBF kernel
+    >>> loss = create_distribution_loss('mmd', lambda_mmd=1e-2, sigma=2.0)
+    >>> 
+    >>> # Statistical loss with all components
+    >>> loss = create_distribution_loss('statistical', 
+    ...                               lambda_moments=1e-2, 
+    ...                               lambda_corr=1e-3,
+    ...                               lambda_dist=5e-3)
+    """
+    if loss_type == 'energy':
+        return EnergyLoss(**kwargs)
+    elif loss_type == 'mmd':
+        return MMDLoss(**kwargs)
+    elif loss_type == 'wasserstein':
+        return WassersteinLoss(**kwargs)
+    elif loss_type == 'statistical':
+        return StatisticalLoss(**kwargs)
+    elif loss_type == 'adaptive':
+        return AdaptiveLoss(**kwargs)
+    elif loss_type == 'per_sample_mse':
+        return PerSampleMSE(**kwargs)
+    elif loss_type == 'mse':
+        return 'mse'
+    elif loss_type == 'huber':
+        return tf.keras.losses.Huber(**kwargs)
+    
+    else:
+        raise ValueError(f"Unknown loss type: {loss_type}. "
+                        f"Supported types: energy, mmd, wasserstein, statistical, "
+                        f"adaptive, per_sample_mse, mse, huber")

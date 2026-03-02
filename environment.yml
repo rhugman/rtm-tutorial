@@ -16,6 +16,7 @@ dependencies:
   - scikit-learn
   - shapely
   - openpyxl
+  - geopandas
   - pip:
       - -e ./dependencies/flopy
       - -e ./dependencies/pyemu
