@@ -1236,6 +1236,53 @@ def csv_to_ins_file(
     return odf
 
 
+def csv_tpl_from_parnames(parnames, tpl_filename, header="parnme,parval1"):
+    """write a template file for a vertical name,value CSV.
+
+    The single canonical writer for the ``name,~   name   ~`` per-line
+    template convention used by the emulator interfaces (one parameter per
+    row, values filled into the second column).
+
+    Args:
+        parnames ([`str`]): parameter names, one template line each.
+        tpl_filename (`str`): path and name of the template file to create.
+        header (`str`, optional): CSV header line to write after ``ptf ~``
+            (the matching input file is expected to carry the same header).
+            Pass `None` for a headerless file.  Default is "parnme,parval1".
+
+    """
+    with open(tpl_filename, "w") as f:
+        f.write("ptf ~\n")
+        if header is not None:
+            f.write(header + "\n")
+        for parnme in parnames:
+            f.write("{0},~   {0}   ~\n".format(parnme))
+
+
+def csv_ins_from_obsnames(obsnames, ins_filename):
+    """write an instruction file for a vertical name,value CSV.
+
+    The single canonical writer for the ``l1 ~,~ !name!`` per-line
+    instruction convention used by the emulator interfaces: the first ``l1``
+    skips the CSV header, then each entry of `obsnames` reads one row.
+
+    Args:
+        obsnames: iterable where each element is either a single observation
+            name (`str`) — one value read per row — or a sequence of names
+            for rows carrying several comma-separated values
+            (e.g. ``("out1", "out1_gprstd")`` ->
+            ``l1 ~,~ !out1! ~,~ !out1_gprstd!``).
+        ins_filename (`str`): path and name of the instruction file to create.
+
+    """
+    with open(ins_filename, "w") as f:
+        f.write("pif ~\n")
+        f.write("l1\n")
+        for entry in obsnames:
+            names = [entry] if isinstance(entry, str) else list(entry)
+            f.write("l1" + "".join(" ~,~ !{0}!".format(n) for n in names) + "\n")
+
+
 class InstructionFile(object):
     """class for handling instruction files.
 

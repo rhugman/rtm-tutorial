@@ -10,6 +10,28 @@ from ..logger import Logger
 from pyemu.pst.pst_handler import Pst
 from pyemu.utils.os_utils import run
 
+# pestpp options whose values reference external files. These must not be
+# carried from a source control file into an emulator template dir: the
+# referenced files are not copied there, so PEST++ would crash trying to
+# read them (canonical names and aliases; compared case-insensitively).
+_FILE_REF_PESTPP_OPTIONS = frozenset([
+    "parcov",
+    "ies_parameter_ensemble", "ies_par_en",
+    "ies_observation_ensemble", "ies_obs_en",
+    "ies_weight_ensemble", "ies_weight_en",
+    "ies_restart_observation_ensemble", "ies_restart_obs_en",
+    "ies_restart_parameter_ensemble", "ies_restart_par_en",
+    "da_parameter_ensemble", "da_par_en",
+    "da_observation_ensemble", "da_obs_en",
+    "da_weight_ensemble", "da_weight_en",
+    "da_restart_observation_ensemble", "da_restart_obs_en",
+    "da_restart_parameter_ensemble", "da_restart_par_en",
+    "opt_par_stack", "opt_obs_stack",
+    "mou_dv_population_file", "mou_obs_population_restart_file",
+    "hotstart_resfile",
+])
+
+
 class Emulator:
     """
     Base class for emulators.
@@ -29,11 +51,11 @@ class Emulator:
                 List of transformation specifications. Each dict should have:
                 - 'type': str - Type of transformation (e.g.,'log10', 'normal_score').
                 - 'columns': list of str,optional - Columns to apply the transformation to. If not supplied, transformation is applied to all columns.
-                - Additional kwargs for the transformation (e.g., 'quadratic_extrapolation' for normal score transform).
+                - Additional kwargs for the transformation (e.g., 'extrapolation' for normal score transform).
                 Example:
                 transforms = [
                     {'type': 'log10', 'columns': ['obs1', 'obs2']},
-                    {'type': 'normal_score', 'quadratic_extrapolation': True}
+                    {'type': 'normal_score', 'extrapolation': 'quadratic'}
                 ]
                 Default is None, which means no transformations will be applied.
         verbose : bool, optional
@@ -100,11 +122,16 @@ class Emulator:
         data = self.data
         if data is None:
             raise ValueError("No data provided and no data stored in the emulator")
- 
+
+        # lowercase all name-keyed state at intake so it matches the PEST(++)
+        # world (Pst, ins/tpl files, RunStor .rns files), which is lowercase
+        self._lowercase_intake()
+        data = self.data
+
          # Common preprocessing logic could go here
         self.logger.statement("preparing training data")
-        
-        # apply feature transformations if they exist, etc..        
+
+        # apply feature transformations if they exist, etc..
         # Always use the base class transformation method for consistency
         if self.transforms is not None:
             self.logger.statement("applying feature transforms")
@@ -112,13 +139,47 @@ class Emulator:
         else:
             # Still need to set up a dummy transformer for inverse operations
             from .transformers import AutobotsAssemble
-            self.feature_transformer = AutobotsAssemble(data.copy())
+            self.transformer_pipeline = AutobotsAssemble(data.copy())
             self.data_transformed = data.copy()
-    
+
         return self.data_transformed
 
-        return 
-        
+
+    def _lowercase_intake(self):
+        """Lowercase all name-keyed state held by the emulator.
+
+        The PEST(++) world (Pst, ins/tpl files, RunStor .rns files) is lowercase,
+        and the runstore forward-run path aligns predict() output columns against
+        the lowercase obs names from the .rns file. If the training data carries
+        original (e.g. upper) case, that alignment silently mis-matches. Lowercasing
+        once here keeps every downstream name (data columns, transform 'columns'
+        lists, predict() output) in the same lowercase namespace.
+        """
+        if self.data is not None:
+            old_cols = list(self.data.columns)
+            new_cols = [str(c).lower() for c in old_cols]
+            if new_cols != old_cols:
+                if len(set(new_cols)) != len(new_cols):
+                    dupes = sorted({c for c in new_cols if new_cols.count(c) > 1})
+                    raise ValueError(
+                        f"lowercasing data column names creates duplicate names: {dupes}")
+                changed = [(o, n) for o, n in zip(old_cols, new_cols) if o != n]
+                if len(changed) <= 5:
+                    detail = ", ".join(f"{o}->{n}" for o, n in changed)
+                else:
+                    examples = ", ".join(f"{o}->{n}" for o, n in changed[:5])
+                    detail = f"{len(changed)} columns, e.g. {examples}"
+                self.logger.warn(f"lowercasing emulator data column names: {detail}")
+                self.data = self.data.copy()
+                self.data.columns = new_cols
+
+        # transform 'columns' lists must track the renamed data columns, or
+        # transform application breaks against the lowercased data
+        if self.transforms is not None:
+            for transform in self.transforms:
+                if isinstance(transform, dict) and transform.get('columns') is not None:
+                    transform['columns'] = [str(c).lower() for c in transform['columns']]
+
     def _fit_transformer_pipeline(self, data=None, transforms=None):
         """
         Apply feature transformations to data with customizable transformer sequence.
@@ -147,7 +208,7 @@ class Emulator:
         emulator.apply_feature_transforms(
             transforms=[
                 {'type': 'log10', 'columns': ['flow', 'heads']},
-                {'type': 'normal_score', 'columns': None, 'quadratic_extrapolation': True}
+                {'type': 'normal_score', 'columns': None, 'extrapolation': 'quadratic'}
             ]
         )
         """
@@ -331,7 +392,6 @@ class Emulator:
 
         # Allow subclasses to refine the PST object (e.g. transfer pestpp_options)
         self.logger.statement("Configuring final Pst object")
-        print(kwargs.get("observation_data", None))
         self._configure_pst_object(
                                 pst_obj, pst, 
                                 observation_data=kwargs.get("observation_data", None),
@@ -361,8 +421,19 @@ class Emulator:
         """
         if pst_old is not None:
             if pst_old.pestpp_options is not None:
-                # carry across pestpp options
-                pst_new.pestpp_options = pst_old.pestpp_options.copy()
+                # carry across pestpp options, dropping any that reference
+                # external files (not copied into the template dir)
+                kept, dropped = {}, []
+                for key, value in pst_old.pestpp_options.items():
+                    if key.lower() in _FILE_REF_PESTPP_OPTIONS:
+                        dropped.append(key)
+                    else:
+                        kept[key] = value
+                pst_new.pestpp_options = kept
+                if dropped:
+                    self.logger.statement(
+                        "dropped file-referencing pestpp options from source "
+                        "pst: {0}".format(", ".join(dropped)))
 
             if pst_old.prior_information is not None:
                 # and prior info
@@ -414,16 +485,9 @@ class Emulator:
         return pst_obs_df
 
     def _write_template_file(self, par_df, filename):
-        """Writes a simple CSV template file."""
-        # This implementation assumes parameters are rows in a single-column CSV or similar structure
-        # Subclasses might want different input formats, but a standard vertical CSV is robust.
-        # Format: parnme, parval1
-        
-        with open(filename, 'w') as f:
-            f.write("ptf ~\n")
-            f.write("parnme,parval1\n")
-            for parnme in par_df.index:
-                 f.write(f"{parnme},~   {parnme}   ~\n")
+        """Writes a simple CSV template file (parnme,parval1 rows)."""
+        from pyemu.pst.pst_utils import csv_tpl_from_parnames
+        csv_tpl_from_parnames(par_df.index, filename)
 
     def _write_input_file(self, par_df, filename):
         """Writes the initial input file corresponding to the template."""
@@ -441,18 +505,47 @@ class Emulator:
                 f.write(f"{obsnme},{obs_df.loc[obsnme, 'obsval']}\n") # base value
 
     def _write_instruction_file(self, obs_df, filename):
-        """Writes a simple CSV instruction file."""
+        """Writes a simple CSV instruction file (one value read per row)."""
         # Assumes output format from forward_run.py is: obsnme,simval
-        # Standard vertical CSV
-        with open(filename, 'w') as f:
-            f.write("pif ~\n")
-            f.write("l1\n") # header
-            for obsnme in obs_df.index:
-                f.write(f"l1~,~ !{obsnme}!\n")
+        from pyemu.pst.pst_utils import csv_ins_from_obsnames
+        csv_ins_from_obsnames(obs_df.index, filename)
 
     def _write_forward_run_script(self, filename, emu_file, input_file, output_file, class_name, pst_name=None):
         """Generates the python script that PEST++ runs.
            Subclasses must implement this method to handle specific return types and behaviors."""
         raise NotImplementedError("Subclasses must implement _write_forward_run_script")
+
+    @staticmethod
+    def _write_forward_run_script_body(filename, funcs, target_func, call_args):
+        """Write a self-contained forward_run.py: embeds the source of each
+        function in `funcs` (via inspect.getsource) and calls
+        `target_func(call_args)` under __main__."""
+        import inspect
+
+        lines = [
+            "import sys",
+            "import os",
+            "import pandas as pd",
+            "import numpy as np",
+            "import traceback",
+            "import pickle",
+            "",
+            "sys.path.append(os.getcwd())",
+            ""
+        ]
+        for func in funcs:
+            lines.append(f"# Source for {func.__name__}")
+            lines.append(inspect.getsource(func))
+            lines.append("")
+        lines.append('if __name__ == "__main__":')
+        lines.append(f'    {target_func}({call_args})')
+
+        # generated python sources must be UTF-8: open() without an encoding
+        # uses the locale (cp1252 on windows), while python reads .py as UTF-8
+        # generated python sources must be UTF-8: open() without an encoding
+        # uses the locale (cp1252 on windows), while python reads .py as UTF-8
+        with open(filename, 'w', encoding="utf-8") as f:
+            for line in lines:
+                f.write(line + "\n")
 
     #TODO: implment helper function that scrapes  directory and collates training data from Pst ensemble files + control file information.

@@ -14,7 +14,7 @@ import pandas as pd
 from pyemu.mat.mat_handler import Cov
 from pyemu.utils.pp_utils import pp_file_to_dataframe
 from ..pyemu_warnings import PyemuWarning
-
+from pyemu import en
 EPSILON = 1.0e-7
 
 # class KrigeFactors(pd.DataFrame):
@@ -453,12 +453,13 @@ class SpecSim2d(object):
         self.num_pts = np.prod(xgrid.shape)
         self.sqrt_fftc = np.sqrt(fftc / self.num_pts)
 
-    def draw_arrays(self, num_reals=1, mean_value=1.0):
+    def draw_arrays(self, num_reals=1, mean_value=1.0, rng=None):
         """draw realizations
 
         Args:
             num_reals (`int`): number of realizations to generate
             mean_value (`float`): the mean value of the realizations
+            rng (`numpy.random.RandomState`): random number generator if not using default from pyemu.en
 
         Returns:
             `numpy.ndarray`: a 3-D array of realizations.  Shape
@@ -471,8 +472,12 @@ class SpecSim2d(object):
         reals = []
 
         for ireal in range(num_reals):
-            real = np.random.standard_normal(size=self.sqrt_fftc.shape)
-            imag = np.random.standard_normal(size=self.sqrt_fftc.shape)
+            if rng is None:
+                real = en.rng.standard_normal(size=self.sqrt_fftc.shape)
+                imag = en.rng.standard_normal(size=self.sqrt_fftc.shape)
+            else:
+                real = rng.standard_normal(size=self.sqrt_fftc.shape)
+                imag = rng.standard_normal(size=self.sqrt_fftc.shape)
             epsilon = real + 1j * imag
             rand = epsilon * self.sqrt_fftc
             real = np.real(np.fft.ifftn(rand)) * self.num_pts
@@ -488,7 +493,7 @@ class SpecSim2d(object):
         return reals
 
     def grid_par_ensemble_helper(
-        self, pst, gr_df, num_reals, sigma_range=6, logger=None
+        self, pst, gr_df, num_reals, sigma_range=6, logger=None, rng=None
     ):
         """wrapper around `SpecSim2d.draw()` designed to support `PstFromFlopy`
         and `PstFrom` grid-based parameters
@@ -501,6 +506,7 @@ class SpecSim2d(object):
             sigma_range (`float` (optional)): number of standard deviations
                 implied by parameter bounds in control file. Default is 6
             logger (`pyemu.Logger` (optional)): a logger instance for logging
+            rng (`numpy.random.RandomState` (optional)): random number generator if not using default from pyemu.en
 
         Returns:
             `pyemu.ParameterEnsemble`: an untransformed parameter ensemble of
@@ -581,7 +587,7 @@ class SpecSim2d(object):
                     )
                 )
             self.initialize()
-            reals = self.draw_arrays(num_reals=num_reals, mean_value=mean_arr)
+            reals = self.draw_arrays(num_reals=num_reals, mean_value=mean_arr, rng=rng)
             # put the pieces into the par en
             reals = reals[:, gp_df.i, gp_df.j].reshape(num_reals, gp_df.shape[0])
             real_arrs.append(reals)
@@ -691,10 +697,10 @@ class SpecSim2d(object):
         # read in the base values, Z(x), assume these are not log-transformed
         values_krige = np.loadtxt(base_values_file)
 
-        np.random.seed(int(seed))
+        rng = np.random.RandomState(int(seed))
 
         # draw random fields for num_reals
-        unconditioned = self.draw_arrays(num_reals=num_reals, mean_value=mean_value)
+        unconditioned = self.draw_arrays(num_reals=num_reals, mean_value=mean_value, rng=rng)
 
         # If geostruct is log transformed, then work with log10 of field
         if self.geostruct.transform == "log":
@@ -754,13 +760,17 @@ class OrdinaryKrigePPU(object):
 
     Off-loading the much of the computational effort to Pypestutils.
     """
-    def __init__(self, geostruct, point_data, express=False):
+    def __init__(self, geostruct, point_data, express=False, auto=False):
         """Initialize OrdinaryKrigePPU object.
 
         Args:
             geostruct None: Dummy argument to match OrdinaryKrige signature.
             point_data (`pandas.DataFrame`): the conditioning points to use for kriging.
                 `point_data` must contain columns "name", "x", "y". Optionally "zone".
+            auto (bool): if set to true, use pypestutil's auto krige function, which 
+                automatically estimates search radius and variogram parameters
+                based on pilot point density
+
 
         Note:
             if `point_data` is an `str`, then it is assumed to be a pilot points file
@@ -783,6 +793,14 @@ class OrdinaryKrigePPU(object):
         assert "y" in point_data.columns, "point_data missing 'y'"
 
         self.point_data = point_data
+
+        assert isinstance(auto, bool), "auto must be a boolean"
+        self.auto = auto
+
+        if self.auto:
+            print("Warning: OrdinaryKrigingPPU's Auto argument is set to true." \
+            "Variograms will be determined by pypestutils. " \
+            "Ignoring user-provided variogram and search radius parameters.")
 
         if not express:
             self.check_names()
@@ -932,24 +950,39 @@ class OrdinaryKrigePPU(object):
         maxpts_interp = kwargs.get('maxpts_interp',50)
         search_radius = kwargs.get("search_dist", kwargs.get('search_radius',1.0e10))
 
-        num_interp_pts = plib.calc_kriging_factors_2d(
-            self.point_data.x.values,  # source xs
-            self.point_data.y.values,  # source ys
-            self.point_data.zone.values,  # source zones
-            x.ravel(), # target xs
-            y.ravel(), # target ys
-            zone_array.ravel().astype(int), # target zones
-            vartype,
-            krigtype,
-            corrlen,
-            aniso,
-            bearing,
-            search_radius,
-            maxpts_interp,
-            minpts_interp,
-            fac_fname,
-            factorfiletype
-        )
+        if self.auto:
+            num_interp_pts = plib.calc_kriging_factors_auto_2d(
+                self.point_data.x.values,  # source xs
+                self.point_data.y.values,  # source ys
+                self.point_data.zone.values,  # source zones
+                x.ravel(), # target xs
+                y.ravel(), # target ys
+                zone_array.ravel().astype(int), # target zones
+                krigtype,
+                aniso,
+                bearing,
+                fac_fname,
+                factorfiletype
+            )
+        else:
+            num_interp_pts = plib.calc_kriging_factors_2d(
+                self.point_data.x.values,  # source xs
+                self.point_data.y.values,  # source ys
+                self.point_data.zone.values,  # source zones
+                x.ravel(), # target xs
+                y.ravel(), # target ys
+                zone_array.ravel().astype(int), # target zones
+                vartype,
+                krigtype,
+                corrlen,
+                aniso,
+                bearing,
+                search_radius,
+                maxpts_interp,
+                minpts_interp,
+                fac_fname,
+                factorfiletype
+            )
         if self.lib is None: # if not context managed
             plib.free_all_memory()
         assert os.path.exists(fac_fname)

@@ -1,0 +1,9 @@
+# Synthetic truth as the curriculum spine, despite having real field data
+
+The repo ships real DIZON field observations (multi-site, multi-species, 854-day breakthrough data) — yet the core history-matching/emulation sequence conditions on a **synthetic truth**: a single realisation held out from the prior ensemble, deliberately chosen from the upper quartile of the prior forecast distribution (peak supply-well SO₄ ≈ 87–95 mg/L), so the prior median under-predicts it and conditioning visibly corrects toward truth — mirroring what the real history match does (posterior shifts up and tightens). We decided this because the pedagogy depends on scoring — "did the posterior cover the truth?", "does the emulator reproduce what the full model would have said?" — and those questions are unanswerable against real data, where model-structural error makes every misfit ambiguous (bad method? bad model? bad weights?). Real data appears exactly twice: as motivation/credibility evidence in the model-build notebook, and in an optional closing capstone that confronts structural error honestly as its own lesson.
+
+## Considered Options
+
+- Real data throughout — instantly credible to RTM modellers, rejected because structural error contaminates every method lesson and "truth coverage" is unknowable.
+- Random held-out realisation (the original `random_state=0` approach) — rejected in favour of a *deliberately chosen* realisation: the truth should make the decision lesson land (prior under-predicts; data correct the design value).
+- A truth "near a regulatory threshold" — rejected 2026-06-05: the prior never approaches 250 mg/L (max ≈ 98; field data ≈ 110), so threshold-straddling framing was vacuous. The decision question is minimization/design (see CONTEXT.md), and thresholds survive only as an illustrative risk lens.

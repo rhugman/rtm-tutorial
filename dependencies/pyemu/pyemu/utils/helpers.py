@@ -108,7 +108,7 @@ def _try_pdcol_numeric(x, first=True, intadj=0, **kwargs):
 
 
 def autocorrelated_draw(pst,struct_dict,time_distance_col="distance",num_reals=100,verbose=True,
-                        enforce_bounds=False, draw_ineq=False):
+                        enforce_bounds=False, draw_ineq=False, rng=None):
     """construct an autocorrelated observation noise ensemble from covariance matrices
         implied by geostatistical structure(s).
 
@@ -129,6 +129,7 @@ def autocorrelated_draw(pst,struct_dict,time_distance_col="distance",num_reals=1
                 these are present in `* observation data`.  Default is False
             draw_ineq (`bool`, optional): flag to generate noise realizations for inequality observations.
                 If False, noise will not be added inequality observations in the ensemble.  Default is False
+            rng (`numpy.random.RandomState`, optional): random number generator if not using default from pyemu.en
 
 
         Returns
@@ -178,7 +179,7 @@ def autocorrelated_draw(pst,struct_dict,time_distance_col="distance",num_reals=1
     fcov_dict = {o:np.sqrt(fcov.x[i]) for i,o in enumerate(fcov.names)}
     if verbose:
         print("-->draw full obs en from diagonal cov")
-    full_oe = pyemu.ObservationEnsemble.from_gaussian_draw(pst,fcov,num_reals=num_reals,fill=True)
+    full_oe = pyemu.ObservationEnsemble.from_gaussian_draw(pst,fcov,num_reals=num_reals,fill=True,rng=rng)
     keys = list(struct_dict.keys())
     keys.sort()
     #for gs,onames in struct_dict.items():
@@ -195,7 +196,7 @@ def autocorrelated_draw(pst,struct_dict,time_distance_col="distance",num_reals=1
             gcov.x[i, :] *= fcov_dict[name]
         if verbose:
             print("...draw")
-        oe = pyemu.ObservationEnsemble.from_gaussian_draw(pst,gcov,num_reals=num_reals,fill=False,by_groups=False)
+        oe = pyemu.ObservationEnsemble.from_gaussian_draw(pst,gcov,num_reals=num_reals,fill=False,by_groups=False,rng=rng)
         oe = oe.loc[:,gcov.names]
         full_oe.loc[:,gcov.names] = oe._df.values
 
@@ -245,7 +246,7 @@ def autocorrelated_draw(pst,struct_dict,time_distance_col="distance",num_reals=1
 
 def draw_by_group(pst, num_reals=100, sigma_range=6, use_specsim=False,
                   struct_dict=None, delr=None, delc=None, scale_offset=True,
-                  echo=True, logger=False):
+                  echo=True, logger=False, rng=None):
     """Draw a parameter ensemble from the distribution implied by the initial parameter values in the
     control file and a prior parameter covariance matrix derived from grouped geostructures.
     Previously in pst_from.
@@ -283,6 +284,7 @@ def draw_by_group(pst, num_reals=100, sigma_range=6, use_specsim=False,
         echo (`bool`): Verbosity flag passed to new Logger instance if
             `logger`is None
         logger (`pyemu.Logger`, optional): Object for logging process
+        rng (`numpy.random.RandomState`, optional): random number generator if not using default from pyemu.en
 
     Returns:
         `pyemu.ParameterEnsemble`: a prior parameter ensemble
@@ -352,6 +354,7 @@ def draw_by_group(pst, num_reals=100, sigma_range=6, use_specsim=False,
                             num_reals=num_reals,
                             sigma_range=sigma_range,
                             logger=logger,
+                            rng=rng
                         )
                         # append to list of specsim drawn pars
                         gr_pe_l.append(gr_pe1)
@@ -379,7 +382,8 @@ def draw_by_group(pst, num_reals=100, sigma_range=6, use_specsim=False,
             num_reals=num_reals,
             sigma_range=sigma_range,
             scale_offset=scale_offset,
-            subset=subset
+            subset=subset,
+            rng=rng
         )
         logger.log(f"Drawing {len(subset)} non-specsim pars")
         if gr_par_pe is not None:
@@ -397,7 +401,7 @@ def draw_by_group(pst, num_reals=100, sigma_range=6, use_specsim=False,
 
 def geostatistical_draws(
     pst, struct_dict, num_reals=100, sigma_range=4, verbose=True,
-        scale_offset=True, subset=None
+        scale_offset=True, subset=None, rng=None
 ):
     """construct a parameter ensemble from a prior covariance matrix
     implied by geostatistical structure(s) and parameter bounds.
@@ -421,6 +425,7 @@ def geostatistical_draws(
             Default is True.
         subset (`array-like`, optional): list, array, set or pandas index defining subset of parameters
             for draw.
+        rng (`numpy.random.RandomState`, optional): random number generator if not using default from pyemu.en
 
     Returns
         **pyemu.ParameterEnsemble**: the realized parameter ensemble.
@@ -558,7 +563,7 @@ def geostatistical_draws(
                     cov.x[i, i] = full_cov_dict[name]
                 # no fixed values here
                 pe = pyemu.ParameterEnsemble.from_gaussian_draw(
-                    pst=pst, cov=cov, num_reals=num_reals, by_groups=False, fill=False
+                    pst=pst, cov=cov, num_reals=num_reals, by_groups=False, fill=False, rng=rng
                 )
                 par_ens.append(pe._df)
                 pars_in_cov.update(set(pe.columns))
@@ -575,7 +580,7 @@ def geostatistical_draws(
         # cov = full_cov.get(diff,diff)
         # here we fill in the fixed values
         pe = pyemu.ParameterEnsemble.from_gaussian_draw(
-            pst, cov, num_reals=num_reals, fill=False
+            pst, cov, num_reals=num_reals, fill=False, rng=rng
         )
         par_ens.append(pe._df)
     par_ens = pd.concat(par_ens, axis=1)
@@ -2035,6 +2040,8 @@ def _process_array_file(model_file, df):
                 continue
             if str(mlt).endswith(".npy"):
                 mlt_data = np.load(mlt)
+                if mlt_data.ndim == 1:
+                    mlt_data = np.atleast_2d(mlt_data).T   
             else:
                 mlt_data = np.loadtxt(mlt, ndmin=2)
             if 1 in list(mlt_data.shape): # if 1d arrays
@@ -2057,7 +2064,30 @@ def _process_array_file(model_file, df):
                         operator, mlt
                     )
                 )
-        if "upper_bound" in df.columns:
+        # load zone array if available to mask bounds clipping
+        zone_arr = None
+        if "zone_file" in df.columns:
+            zone_files = df_mf.zone_file.dropna().unique()
+            if len(zone_files) == 1:
+                zone_arr = np.loadtxt(zone_files[0], ndmin=2)
+            elif len(zone_files) > 1:
+                zone_arr = np.zeros_like(org_arr)
+                for zf in zone_files:
+                    za = np.loadtxt(zf, ndmin=2)
+                    zone_arr[za != 0] = 1
+
+        # apply upper bound - array file takes precedence over scalar
+        if "upper_bound_file" in df.columns and df_mf.upper_bound_file.dropna().shape[0] > 0:
+            ub_files = df_mf.upper_bound_file.dropna().unique()
+            if len(ub_files) > 1:
+                raise Exception("different upper_bound_files for {0}".format(org_file))
+            ub_arr = np.loadtxt(ub_files[0], ndmin=2)
+            if zone_arr is not None:
+                mask = (org_arr > ub_arr) & (zone_arr != 0)
+            else:
+                mask = org_arr > ub_arr
+            org_arr[mask] = ub_arr[mask]
+        elif "upper_bound" in df.columns:
             ub_vals = df_mf.upper_bound.value_counts().dropna().to_dict()
             if len(ub_vals) == 0:
                 pass
@@ -2066,8 +2096,24 @@ def _process_array_file(model_file, df):
                 raise Exception("different upper bound values for {0}".format(org_file))
             else:
                 ub = float(list(ub_vals.keys())[0])
-                org_arr[org_arr > ub] = ub
-        if "lower_bound" in df.columns:
+                if zone_arr is not None:
+                    mask = (org_arr > ub) & (zone_arr != 0)
+                else:
+                    mask = org_arr > ub
+                org_arr[mask] = ub
+
+        # apply lower bound - array file takes precedence over scalar
+        if "lower_bound_file" in df.columns and df_mf.lower_bound_file.dropna().shape[0] > 0:
+            lb_files = df_mf.lower_bound_file.dropna().unique()
+            if len(lb_files) > 1:
+                raise Exception("different lower_bound_files for {0}".format(org_file))
+            lb_arr = np.loadtxt(lb_files[0], ndmin=2)
+            if zone_arr is not None:
+                mask = (org_arr < lb_arr) & (zone_arr != 0)
+            else:
+                mask = org_arr < lb_arr
+            org_arr[mask] = lb_arr[mask]
+        elif "lower_bound" in df.columns:
             lb_vals = df_mf.lower_bound.value_counts().dropna().to_dict()
             if len(lb_vals) == 0:
                 pass
@@ -2075,7 +2121,11 @@ def _process_array_file(model_file, df):
                 raise Exception("different lower bound values for {0}".format(org_file))
             else:
                 lb = float(list(lb_vals.keys())[0])
-                org_arr[org_arr < lb] = lb
+                if zone_arr is not None:
+                    mask = (org_arr < lb) & (zone_arr != 0)
+                else:
+                    mask = org_arr < lb
+                org_arr[mask] = lb
 
     try:
         fmt = df_mf.fmt.iloc[0]
@@ -3852,7 +3902,7 @@ def _maha(delta,v,x,z,lower_inv):
     return d_m
 
 
-def get_maha_obs_summary(sim_en, l1_crit_val=6.34, l2_crit_val=9.2):
+def get_maha_obs_summary(sim_en, l1_crit_val=6.34, l2_crit_val=9.2, rng=None):
     """calculate the 1-D and 2-D mahalanobis distance between simulated
     ensemble and observed values.  Used for detecting prior-data conflict
 
@@ -3862,6 +3912,7 @@ def get_maha_obs_summary(sim_en, l1_crit_val=6.34, l2_crit_val=9.2):
             mahalanobis distance.  Default is 6.4 (p=0.01,df=1)
         l2_crit_val (`float`): the chi squared critical value for the 2-D
             mahalanobis distance.  Default is 9.2 (p=0.01,df=2)
+        rng (np.random.RandomState): random number generator if not using default from pyemu.en
 
     Returns:
 
@@ -3877,7 +3928,6 @@ def get_maha_obs_summary(sim_en, l1_crit_val=6.34, l2_crit_val=9.2):
             noise.
 
     """
-
     if not isinstance(sim_en, pyemu.ObservationEnsemble):
         raise Exception("'sim_en' must be a " + " pyemu.ObservationEnsemble instance")
     if sim_en.pst.nnz_obs < 1:
@@ -3894,7 +3944,7 @@ def get_maha_obs_summary(sim_en, l1_crit_val=6.34, l2_crit_val=9.2):
     nnz_en.reseed()
     obsmean = obs.loc[nnz_en.columns.values, "obsval"]
     noise_en = pyemu.ObservationEnsemble.from_gaussian_draw(
-        sim_en.pst, num_reals=sim_en.shape[0]
+        sim_en.pst, num_reals=sim_en.shape[0], rng=rng
     )
     noise_en -= obsmean  # subtract off the obs val bc we just want the noise
     noise_en.index = nnz_en.index
@@ -4174,7 +4224,7 @@ def apply_threshold_pars(csv_file):
         return tarr.mean(), 1.0
 
         #    print("WARNING: thresholding array {0} has very low standard deviation, adding noise".format(thresarr_file))
-        #    tarr += np.random.normal(0, tol*2.0, tarr.shape)
+        #    tarr += pyemu.en.rng.normal(0, tol*2.0, tarr.shape)
 
     # a classic:
     gr = (np.sqrt(5.) + 1.) / 2.
@@ -4445,10 +4495,7 @@ def prep_for_gpr(pst_fname,input_fnames,output_fnames,gpr_t_d="gpr_template",t_d
 
     #write a template file
     tpl_fname = os.path.join(gpr_t_d,"gpr_input.csv.tpl")
-    with open(tpl_fname,'w') as f:
-        f.write("ptf ~\nparnme,parval1\n")
-        for input_name in input_names:
-            f.write("{0},~  {0}   ~\n".format(input_name))
+    pyemu.pst_utils.csv_tpl_from_parnames(input_names, tpl_fname)
     other_pars = list(set(pst.par_names)-set(input_names))
     aux_tpl_fname = None
 
@@ -4456,19 +4503,14 @@ def prep_for_gpr(pst_fname,input_fnames,output_fnames,gpr_t_d="gpr_template",t_d
 
         aux_tpl_fname = os.path.join(gpr_t_d,"aux_par.csv.tpl")
         print("writing aux par tpl file: ",aux_tpl_fname)
-        with open(aux_tpl_fname,'w') as f:
-            f.write("ptf ~\n")
-            for input_name in other_pars:
-                f.write("{0},~  {0}   ~\n".format(input_name))
+        pyemu.pst_utils.csv_tpl_from_parnames(other_pars, aux_tpl_fname, header=None)
     #write an ins file
     ins_fname = os.path.join(gpr_t_d,"gpr_output.csv.ins")
-    with open(ins_fname,'w') as f:
-        f.write("pif ~\nl1\n")
-        for output_name in output_names:
-            if include_emulated_std_obs:
-                f.write("l1 ~,~ !{0}! ~,~ !{0}_gprstd!\n".format(output_name))
-            else:
-                f.write("l1 ~,~ !{0}!\n".format(output_name))
+    if include_emulated_std_obs:
+        entries = [(o, "{0}_gprstd".format(o)) for o in output_names]
+    else:
+        entries = list(output_names)
+    pyemu.pst_utils.csv_ins_from_obsnames(entries, ins_fname)
     tpl_list = [tpl_fname]
     if aux_tpl_fname is not None:
         tpl_list.append(aux_tpl_fname)
@@ -4490,7 +4532,7 @@ def prep_for_gpr(pst_fname,input_fnames,output_fnames,gpr_t_d="gpr_template",t_d
         # why is it getting so strict?!  isn't python duck-typed?
         if col in gpst.observation_data.columns and \
                 gpst.observation_data.dtypes[col] != pst.observation_data.dtypes[col]:
-            gpst.observation_data[col] = gpst.obsveration_data[col].astype(pst.observation_data.dtypes[col])
+            gpst.observation_data[col] = gpst.observation_data[col].astype(pst.observation_data.dtypes[col])
         gpst.observation_data.loc[output_names,col] = pst.observation_data.loc[output_names,col].values
     if include_emulated_std_obs:
         stdobs = [o for o in gpst.obs_names if o.endswith("_gprstd")]
@@ -4502,7 +4544,7 @@ def prep_for_gpr(pst_fname,input_fnames,output_fnames,gpr_t_d="gpr_template",t_d
     frun_lines = inspect.getsource(gpr_forward_run)
     getfxn_lines = inspect.getsource(get_gpr_model_dict)
     emulfxn_lines = inspect.getsource(emulate_with_gpr)
-    with open(os.path.join(gpr_t_d, "forward_run.py"), 'w') as f:
+    with open(os.path.join(gpr_t_d, "forward_run.py"), 'w', encoding="utf-8") as f:
         f.write("\n")
         for import_name in ["pandas as pd","os","pickle","numpy as np"]:
             f.write("import {0}\n".format(import_name))
@@ -4846,18 +4888,16 @@ def gpr_runstore_forward_run(ws='.', emu_file="gpr_emulator.pkl", pst_name="gpr"
 
 def dsi_runstore_forward_run(ws='.', pst_name="dsi"):
     import os
+    import re
+    import pickle
     from pyemu.utils.helpers import RunStor
+    emu_file = os.path.join(ws, "dsi.pickle")
     try:
-        from pyemu.emulators import DSIAE
-        dsi = DSIAE.load(os.path.join(ws,"dsi.pickle"))
-        latent_dim = dsi.latent_dim
-    except:
-        try:
-            from pyemu.emulators import DSI
-            dsi = DSI.load(os.path.join(ws,"dsi.pickle"))
-            latent_dim = dsi.s.shape[0]
-        except Exception as e:
-            raise Exception("failed to load DSI or DSIAE from dsi.pickle:{0}".format(str(e)))
+        with open(emu_file, "rb") as f:
+            dsi = pickle.load(f)
+    except Exception as e:
+        raise Exception("failed to load emulator from {0}: {1}".format(emu_file, str(e)))
+    latent_dim = dsi.latent_dim
 
     fname = os.path.join(ws, f"{pst_name}.rns")
     if not os.path.exists(fname):
@@ -4866,9 +4906,21 @@ def dsi_runstore_forward_run(ws='.', pst_name="dsi"):
     rs = RunStor(fname)
     df = rs.get_data()
 
-    # sort par_names to match latent dimension order
-    # sort by the integer after the prefix
-    par_names.sort(key=lambda x: int(x.split("_")[-1]))
+    # sort par_names to match latent dimension order.
+    # predict() consumes pvals positionally (pmat @ pvals.T / decoder), so column i
+    # must be latent dimension i.  The latent index is the trailing integer of the
+    # parameter name; the regex handles both "p_3"/"sv_3" and "dsi_par0000", the
+    # latter of which int(x.split("_")[-1]) cannot parse.
+    def _latent_index(pname):
+        m = re.search(r"(\d+)$", pname)
+        if m is None:
+            raise ValueError(
+                "could not parse latent index (trailing integer) "
+                "from parameter name: {0}".format(pname)
+            )
+        return int(m.group(1))
+
+    par_names.sort(key=_latent_index)
 
     pvals = df.loc[:,par_names]
     assert pvals.shape[1] == latent_dim, "number of parameters in runstor does not match DSI latent dimension"
@@ -4883,33 +4935,18 @@ def dsi_runstore_forward_run(ws='.', pst_name="dsi"):
 
 def dsi_file_forward_run(emu_file="dsi.pickle", input_file="dsi_pars.csv", output_file="dsi_sim_vals.csv"):
     import os
+    import pickle
     import pandas as pd
     import traceback
-    
-    try:
-        # Try loading as DSIAE first, then DSI
-        try:
-            from pyemu.emulators import DSIAE, DSI
-        except ImportError:
-            # Should be available in standard installation
-            raise ImportError("pyemu.emulators.DSI and/or DSIAE could not be imported")
 
-        emu = None
-        # Try DSIAE.load (checks for folder/zip etc)
+    try:
         try:
-             emu = DSIAE.load(emu_file)
-        except:
-             pass
-        
-        # If not loaded, try DSI.load (standard pickle)
-        if emu is None:
-             try:
-                 emu = DSI.load(emu_file)
-             except Exception as e:
-                 raise Exception(f"Failed to load emulator from {emu_file}. Tried DSIAE.load and DSI.load. Error: {e}")
+            with open(emu_file, "rb") as f:
+                emu = pickle.load(f)
+        except Exception as e:
+            raise Exception(f"Failed to load emulator from {emu_file}: {e}")
 
         if not os.path.exists(input_file):
-        # ...
              raise FileNotFoundError(f"Input file {input_file} not found")
              
         input_df = pd.read_csv(input_file, index_col=0)
@@ -4945,123 +4982,6 @@ def dsi_forward_run(pvals,dsi,write_csv=False):
     if write_csv:
         sim_vals.to_csv("dsi_sim_vals.csv")
     return sim_vals
-
-def dsivc_forward_run(md_ies=".",ies_exe_path="pestpp-ies",num_workers=1):
-    import pandas as pd
-    import pyemu
-    import os
-    import pickle
-    from pyemu.utils.os_utils import PortManager
-
-    # load the dsi pest control file
-    pst_dsi = pyemu.Pst(os.path.join(md_ies,"dsi.pst"))
-    noptmax = pst_dsi.control_data.noptmax
-    if noptmax==-1:
-        noptmax=0
-
-    try:
-        os.remove("dsi.noise.jcb")
-    except:
-        print("dsi.noise.jcb not found, continuing...")
-    try:
-        os.remove("dsi.stack.csv")
-    except:
-        print("dsi.stack.csv not found, continuing...")
-    try:
-        os.remove("dsi.stack_stats.csv")
-    except:
-        print("dsi.stack_stats.csv not found, continuing...")
-    try:
-        os.remove(f"dsi.{noptmax}.obs.jcb")
-    except:
-        print(f"dsi.{noptmax}.obs.jcb not found, continuing...")
-
-    # load decvars
-    decvars = pd.read_csv(os.path.join(md_ies, "dsivc_pars.csv"),index_col=0)
-    assert decvars.shape[0]>0, "no decvars found in dsivc_pars.csv"
-
-
-
-    # update the decavar obs values in the observation data
-    obs = pst_dsi.observation_data
-    assert obs.loc[decvars.index].shape[0] == decvars.shape[0], "not all decvars found in obs data"
-    assert all(obs.loc[decvars.index].weight > 0.0), "decvar weights should be > 0.0"
-    obs.loc[decvars.index,"obsval"] = decvars.values
-
-    # update the obs+noise file with the decvar values to ensure NO NOISE on the decvars
-    try:
-        noise = pyemu.ObservationEnsemble.from_binary(pst_dsi,os.path.join(md_ies,"dsi.obs+noise.jcb"))
-    except:
-         noise = pyemu.ObservationEnsemble.from_csv(pst_dsi,os.path.join(md_ies,"dsi.obs+noise.csv"))
-    # check that all of decvars.index are in noise.columns
-    assert len([i for i in decvars.index if i not in noise.columns.tolist()]) == 0, "some decvars not in noise columns"
-    # update columns in noise if column name in decvars.index
-    for col in decvars.index:
-        noise.loc[:,col] = noise.loc[:,col].astype(float)
-        noise.loc[:,col] = decvars.loc[col].values[0]
-    # record noise 
-    noise.to_binary(os.path.join(md_ies,"dsi.noise.jcb"))
-    # make sure pestpp options 
-    pst_dsi.pestpp_options["ies_observation_ensemble"] = "dsi.noise.jcb"
-    # rewrite the dsi.pst file 
-    pst_dsi.write(os.path.join(md_ies,"dsi.pst"),version=2)
-
-    # deploy dsi...
-    pvals = pd.read_csv(os.path.join(md_ies,"dsi_pars.csv"),index_col=0)
-    
-    worker_root="."
-    dsi = pickle.load(open(os.path.join(md_ies,"dsi.pickle"),"rb"))
-
-    # read forward_run.py and check the name of the function in __main__
-    frun_lines = open(os.path.join(md_ies,"forward_run.py"),'r').readlines()
-    main_func_name = frun_lines[-1].strip().replace("()","")
-    print(main_func_name,"will be called for forward run")
-    if main_func_name.startswith("dsi_runstore_forward_run"):
-        print("running dsi_runstore_forward_run")
-        pyemu.os_utils.run(f'{ies_exe_path} dsi.pst /e', cwd=md_ies, verbose=True)
-    elif main_func_name.startswith("dsi_forward_run"):
-        num_workers = dsi.dsi_args.get("num_pyworkers",1)
-        print(num_workers,"workers requested for dsi")
-        pyemu.os_utils.start_workers(md_ies,ies_exe_path,"dsi.pst",
-                                    num_workers=num_workers,
-                                    worker_root=worker_root,
-                                    port = PortManager().get_available_port(),
-                                        master_dir=md_ies,
-                                        reuse_master =True,
-                                        ppw_function=pyemu.helpers.dsi_pyworker,
-                                        ppw_kwargs={"dsi":dsi,"pvals":pvals})  
-    assert os.path.exists(os.path.join(md_ies,f"dsi.{noptmax}.obs.jcb")) or os.path.exists(os.path.join(md_ies,f"dsi.{noptmax}.obs.csv")), f"dsi.{noptmax}.obs.[jcb|csv] not found...pst failed?"
-
-
-    #TODO: checks on PDC or Eulerian distance to training data?
-
-    #postprocess stack
-    try:
-        oe = pyemu.ObservationEnsemble.from_binary(pst_dsi,os.path.join(md_ies,f"dsi.{noptmax}.obs.jcb"))
-    except:
-        oe = pyemu.ObservationEnsemble.from_csv(pst_dsi,os.path.join(md_ies,f"dsi.{noptmax}.obs.csv"))
-    assert oe.shape[0] == noise.shape[0], "stack and noise shapes do not match; failed runs?"
-    if dsi.dsivc_args.get("track_stack",False):
-        # write long form oe
-        stack = oe._df.reset_index().melt(id_vars="real_name")
-        stack.rename(columns={"value":"obsval"},inplace=True)
-        stack['obsnme'] = stack.apply(lambda x: x.variable+"_real:"+x.real_name,axis=1)
-        stack.set_index("obsnme",inplace=True)
-        stack = stack.obsval
-        out_file = os.path.join(md_ies,"dsi.stack.csv")
-        stack.to_csv(out_file,float_format="%.6e")
-    #write stats
-    #get user-specified quantiles
-    percentiles = dsi.dsivc_args.get("percentiles",[0.25,0.75,0.5])
-    stack_stats = oe._df.describe(percentiles=percentiles).reset_index().melt(id_vars="index")
-    stack_stats.rename(columns={"value":"obsval","index":"stat"},inplace=True)
-    stack_stats['obsnme'] = stack_stats.apply(lambda x: x.variable+"_stat:"+x.stat,axis=1)
-    stack_stats.set_index("obsnme",inplace=True)
-    stack_stats = stack_stats.obsval
-    out_file = os.path.join(md_ies,"dsi.stack_stats.csv")
-    stack_stats.to_csv(out_file,float_format="%.6e")
-
-    return
 
 def dsi_pyworker(pst,host,port,dsi=None,pvals=None):
     
@@ -5124,11 +5044,7 @@ def series_to_insfile(out_file,ins_file=None):
     sdf = pd.read_csv(out_file,index_col=0)
     assert sdf.shape[1] == 1, "only one column allowed"
     sdf = sdf.iloc[:,0]
-    with open(ins_file,'w') as f:
-        f.write("pif ~\n")
-        f.write("l1\n")
-        for oname in sdf.index.values:
-            f.write("l1 ~,~ !{0}!\n".format(oname))
+    pyemu.pst_utils.csv_ins_from_obsnames(sdf.index.values, ins_file)
     return
 
 
@@ -5186,17 +5102,13 @@ def add_phi_as_obs(pst_name,pst_path='.'):
     pst = pyemu.Pst(os.path.join(pst_path,pst_name))
     import inspect
     lines = inspect.getsource(calc_phi)
-    with open(os.path.join(pst_path,"calc_phi.py"),'w') as f:
+    with open(os.path.join(pst_path,"calc_phi.py"),'w',encoding="utf-8") as f:
         f.write(lines)
         f.write("\n")
         f.write("if __name__ == '__main__':\n")
         f.write("    calc_phi('{0}')\n".format(pst_name))
     ifile_name = os.path.join(pst_path,"phi_components.csv.ins")
-    with open(os.path.join(ifile_name),'w') as f:
-        f.write("pif ~\n")
-        f.write("l1\n")
-        for idx_val in df.index:
-            f.write("l1 ~,~ !{0}!\n".format(idx_val))
+    pyemu.pst_utils.csv_ins_from_obsnames(df.index, ifile_name)
     pdf = pst.add_observations(ifile_name,ifile_name.replace(".ins",""),pst_path='.')
     pst.observation_data.loc[pdf.obsnme.values,"weight"] = 0.0
     pst.observation_data.loc[pdf.obsnme.values, "obsval"] = 0.0

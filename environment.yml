@@ -16,11 +16,12 @@ dependencies:
   - scikit-learn
   - shapely
   - openpyxl
-  - geopandas
+  - psutil
   - pip:
       - -e ./dependencies/flopy
       - -e ./dependencies/pyemu
       - -e ./dependencies/mf6rtm
       - -e ./dependencies/vorflow
+      - modflowapi
       - pypestutils
       - vtk

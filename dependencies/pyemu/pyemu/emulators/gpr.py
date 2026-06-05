@@ -2,6 +2,7 @@
 Gaussian Process Regression (GPR) emulator implementation.
 """
 from __future__ import print_function, division
+import copy
 import numpy as np
 import pandas as pd
 import os
@@ -67,11 +68,15 @@ class GPR(Emulator):
             raise ValueError("input_names must be a list or None")
         if output_names is not None and not isinstance(output_names, list):
             raise ValueError("output_names must be a list or None")
-        self.input_names = input_names
-        self.output_names = output_names
+        # lowercase on entry so they keep matching the lowercased data columns
+        # (the PEST(++) world is lowercase; see Emulator._lowercase_intake)
+        self.input_names = [str(n).lower() for n in input_names] if input_names is not None else None
+        self.output_names = [str(n).lower() for n in output_names] if output_names is not None else None
 
         self.kernel = kernel
-        self.transforms = transforms
+        # deep-copy so the shared default list and caller-owned dicts are never
+        # mutated by _validate_transforms_for_gpr
+        self.transforms = copy.deepcopy(transforms) if transforms is not None else None
         self.n_restarts_optimizer = n_restarts_optimizer
         self.return_std = return_std
         
@@ -85,7 +90,11 @@ class GPR(Emulator):
         
         # PEST++ integration
         self.template_dir = None
-        
+
+        # lowercase data columns and transform 'columns' lists at intake so they
+        # match the lowercased input_names/output_names before validation
+        self._lowercase_intake()
+
         # Validate transforms parameter
         if transforms is not None:
             self._validate_transforms(transforms)
@@ -96,8 +105,9 @@ class GPR(Emulator):
         # Validate transforms parameter
         transforms = self.transforms
         if transforms is not None:
-            # For the speicif case of GPR, we only transform input data    
-            for t in transforms:
+            # For the speicif case of GPR, we only transform input data
+            # iterate over a snapshot: transforms may be removed from the list
+            for t in list(transforms):
                 if 'columns' in t:
                     # check if any columns are in output_names
                     if self.output_names is not None:
@@ -250,24 +260,33 @@ class GPR(Emulator):
         
         if not hasattr(self, 'transformer_pipeline') or self.transformer_pipeline is None:
             raise ValueError("Emulator must be fitted and have valid transformations before prediction")
-        
-        # Apply same transforms as training data
-        X_transformed = self.transformer_pipeline.transform(X.copy())
 
-        
+        # lowercase caller-supplied input columns so they align with the
+        # lowercased input_names / training columns (the PEST(++) world is
+        # lowercase); without this, .loc[:, self.input_names] silently mis-aligns
+        X = X.copy()
+        X.columns = [str(c).lower() for c in X.columns]
+
+        # Apply same transforms as training data
+        X_transformed = self.transformer_pipeline.transform(X)
+
+        # align to the column order used in fit(); raises KeyError if an
+        # input column is missing
+        X_values = X_transformed.loc[:, self.input_names].values
+
         # Make predictions for each output
         predictions_dict = {}
         std_dict = {}
-        
+
         for output_name in self.output_names:
             gpr = self.gpr_models[output_name]
-            
+
             if return_std:
-                pred, std = gpr.predict(X_transformed.values, return_std=True)
+                pred, std = gpr.predict(X_values, return_std=True)
                 predictions_dict[output_name] = pred
                 std_dict[output_name] = std
             else:
-                pred = gpr.predict(X_transformed.values)
+                pred = gpr.predict(X_values)
                 predictions_dict[output_name] = pred
         
         # Convert to DataFrame
@@ -436,67 +455,49 @@ class GPR(Emulator):
         return super().prepare_pestpp(t_d, pst=pst, verbose=verbose, **kwargs)
     
     def _write_output_file(self, obs_df, filename):
-        """Writes GPR-specific output file (handling std dev)."""
+        """Writes GPR-specific output file, mirroring gpr_file_forward_run's
+        runtime format: one line per output, with the std on the same line
+        when return_std is True (matching _write_instruction_file)."""
         with open(filename, 'w') as f:
-            f.write("obsnme,obsval\n") # header
-            for output_name in self.output_names:
-                if self.return_std:
-                    # e.g. "obsnme, val, std"
-                    f.write(f"{output_name},0.0\n")
-                    f.write(f"{output_name}_gprstd,0.0\n")
-                else:
-                    f.write(f"{output_name},0.0\n")
+            if self.return_std:
+                f.write("obsnme,obsval,obsstd\n")
+                for output_name in self.output_names:
+                    val = obs_df.loc[output_name, "obsval"]
+                    std = obs_df.loc[f"{output_name}_gprstd", "obsval"]
+                    f.write(f"{output_name},{val},{std}\n")
+            else:
+                f.write("obsnme,obsval\n")
+                for output_name in self.output_names:
+                    f.write(f"{output_name},{obs_df.loc[output_name, 'obsval']}\n")
 
     def _write_instruction_file(self, obs_df, filename):
         """Writes GPR-specific instruction file (handling std dev)."""
-        with open(filename, 'w') as f:
-            f.write("pif ~\n")
-            f.write("l1\n") # header
-            for output_name in self.output_names:
-                if self.return_std:
-                     # e.g. "obsnme, val, std"
-                     # Instruction: Skip obsnme, read val, read std
-                     f.write("l1 ~,~ !{0}! ~,~ !{0}_gprstd!\n".format(output_name))
-                else:
-                     f.write("l1 ~,~ !{0}!\n".format(output_name))
+        from pyemu.pst.pst_utils import csv_ins_from_obsnames
+        if self.return_std:
+            # each row carries "obsnme,val,std": read val and std per line
+            entries = [(o, f"{o}_gprstd") for o in self.output_names]
+        else:
+            entries = list(self.output_names)
+        csv_ins_from_obsnames(entries, filename)
 
     def _write_forward_run_script(self, filename, emu_file, input_file, output_file, class_name, pst_name=None):
         """Generates the python script that PEST++ runs for GPR (handles tuple return)."""
-        import inspect
         from pyemu.utils.helpers import gpr_file_forward_run, gpr_runstore_forward_run, gpr_forward_run
 
         use_runstor = getattr(self, "_use_runstor", False)
-        
-        target_func = "gpr_runstore_forward_run" if use_runstor else "gpr_file_forward_run"
         if use_runstor:
+            target_func = "gpr_runstore_forward_run"
             call_args = f"emu_file='{emu_file}'"
             if pst_name is not None:
                 call_args += f", pst_name='{pst_name}'"
         else:
+            target_func = "gpr_file_forward_run"
             call_args = f"'{emu_file}', '{input_file}', '{output_file}'"
 
-        lines = [
-            "import sys",
-            "import os",
-            "import pandas as pd",
-            "import numpy as np",
-            "import traceback",
-            "import pickle",
-            "",
-            "sys.path.append(os.getcwd())",
-            ""
-        ]
-
-        # Inject code for all use cases
-        for func in [gpr_forward_run, gpr_file_forward_run, gpr_runstore_forward_run]:
-             lines.append(f"# Source for {func.__name__}")
-             lines.append(inspect.getsource(func))
-             lines.append("")
-
-        lines.append('if __name__ == "__main__":')
-        lines.append(f'    {target_func}({call_args})')
-
-        with open(filename, 'w') as f:
-            for line in lines:
-                f.write(line + "\n")
+        self._write_forward_run_script_body(
+            filename,
+            [gpr_forward_run, gpr_file_forward_run, gpr_runstore_forward_run],
+            target_func,
+            call_args,
+        )
 

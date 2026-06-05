@@ -101,11 +101,11 @@ class LPFA(Emulator):
         List of transformation specifications. Each dict should have:
         - 'type': str - Type of transformation (e.g., 'log10', 'normal_score').
         - 'columns': list of str, optional - Columns to apply the transformation to. If not supplied, transformation is applied to all columns.
-        - Additional kwargs for the transformation (e.g., 'quadratic_extrapolation' for normal score transform).
+        - Additional kwargs for the transformation (e.g., 'extrapolation' for normal score transform).
         Example:
         transforms = [
             {'type': 'log10', 'columns': ['obs1', 'obs2']},
-            {'type': 'normal_score', 'quadratic_extrapolation': True}   
+            {'type': 'normal_score', 'extrapolation': 'quadratic'}   
         ]
         Default is None, which means no transformations will be applied.
     verbose : bool, optional
@@ -149,11 +149,11 @@ class LPFA(Emulator):
             List of transformation specifications. Each dict should have:
             - 'type': str - Type of transformation (e.g.,'log10', 'normal_score').
             - 'columns': list of str,optional - Columns to apply the transformation to. If not supplied, transformation is applied to all columns.
-            - Additional kwargs for the transformation (e.g., 'quadratic_extrapolation' for normal score transform).
+            - Additional kwargs for the transformation (e.g., 'extrapolation' for normal score transform).
             Example:
             transforms = [
                 {'type': 'log10', 'columns': ['obs1', 'obs2']},
-                {'type': 'normal_score', 'quadratic_extrapolation': True}
+                {'type': 'normal_score', 'extrapolation': 'quadratic'}
             ]
             Default is None, which means no transformations will be applied.
         test_size : float, optional
@@ -221,7 +221,11 @@ class LPFA(Emulator):
         data = self.data
         if data is None:
             raise ValueError("No data provided and no data stored in the emulator")
-            
+
+        # lowercase all name-keyed state at intake (see Emulator._lowercase_intake)
+        self._lowercase_intake()
+        data = self.data
+
         # Split the data into training and test sets
         train, test = train_test_split(
             data, 

@@ -1,12 +1,42 @@
+# --- caches / editor / OS cruft ---
 __pycache__/
 *.pyc
-*.DS_Store
-*.vscode
-*Pst
+.DS_Store
+.vscode
+*.code-workspace
+attic/
+.refs/
+
+# --- generated workspaces under tutorials/ (each notebook builds its own) ---
+# Each part1 notebook builds the workspace the next consumes; none of those are
+# tracked. Names below cover every workspace the notebooks create: *_template*
+# (pst/obs/dsi/dsivc templates and their sweeps), master_* (IES/MOU run dirs),
+# tmp/tmp_*, full_model_* (part1_06), and *_sweep / *_training_sweep (part1_08).
+tutorials/**/master_*/
+tutorials/**/*_template*/
+tutorials/**/tmp/
+tutorials/**/tmp_*/
+tutorials/**/workspace*/
+tutorials/**/model/
+tutorials/**/full_model_*/
+tutorials/**/*_sweep/
+
+# --- root-level legacy generated dirs (expensive run results; not tracked) ---
 model/
-pest*
-pst*
-prior*/
-master*/
-worker*
+pst_template*/
+master_*/
+priormc/
 tmp/
+dsi_template/
+
+# --- generated grid (written by part1_01 into its workspace, never data/) ---
+data/mf6_grid.*
+
+# --- root debris (anchored to repo root so docs/, data/ and tutorial figures
+#     stay trackable; tutorial-generated figures live in ignored workspaces) ---
+/*.pdf
+/*.png
+/*.log
+/*.nans.csv
+/PstFrom.log
+/forward_run.py
