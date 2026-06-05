@@ -40,3 +40,5 @@ data/mf6_grid.*
 /*.nans.csv
 /PstFrom.log
 /forward_run.py
+tutorials/**/column/
+tutorials/**/PstFrom.log

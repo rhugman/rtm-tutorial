@@ -67,7 +67,7 @@ HISTORY_END = 252      # decision date: last day usable for conditioning
 SUPPLY_START = 308     # supply well switches on
 SUPPLY_END = 728       # end of the supply period
 COND_SPECIES = ["so4", "o0", "no3", "ph", "tmp"]   # conditioning species (O2 == 'o0')
-FORECAST_SCREEN = "welopt-ly3"   # central supply-well screen; canonical forecast location
+SUPPLY_SCREENS = ["welopt-ly1", "welopt-ly3", "welopt-ly5"]   # ALL supply-well screens; the forecast is the max over every one
 FORECAST_SPECIES = "so4"
 N_REALS_TARGET = 201   # realisations drawn and kept (a handful fail, as ensembles do)
 
@@ -110,12 +110,21 @@ def write_provenance(out_json, *, artifact, source_dir, n_obs, n_reals, notes=""
 # curated obs resolution
 # --------------------------------------------------------------------------- #
 def forecast_obsnames(pst):
-    """Obsnames of the forecast group: supply-well SO4 over the supply period."""
+    """Obsnames of the forecast group: supply-well SO4 over the supply period.
+
+    Prefer the named ``forecast`` obs group if the control file carries one
+    (part1_02 tags it across ALL supply-well screens — the canonical forecast
+    is the max over every screen, so dropping any screen silently corrupts
+    every downstream peak). Fall back to a name-based selection over all
+    supply screens otherwise.
+    """
     od = pst.observation_data.copy()
+    if "forecast" in set(od.obgnme):
+        return od.loc[od.obgnme == "forecast"].obsnme.tolist()
     od["time"] = od["time"].astype(float)
     m = (
         (od.variable == FORECAST_SPECIES)
-        & (od.obsid.astype(str) == FORECAST_SCREEN)
+        & (od.obsid.astype(str).isin(SUPPLY_SCREENS))
         & (od.time >= SUPPLY_START)
         & (od.time <= SUPPLY_END)
     )
