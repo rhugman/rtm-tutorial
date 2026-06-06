@@ -92,6 +92,12 @@ def main():
     if staging.exists():
         shutil.rmtree(staging)
     shutil.copytree(TEMPLATE, staging)
+    # the template carries residue from its own in-notebook test runs; a stale
+    # pest.rns with a different parameter count makes RunStorage::reset() fail
+    for patt in ("pest.rns", "*.rec", "pest.[0-9].*", "pest.obs+noise.jcb",
+                 "pest.phi.*", "test.*", "*.rei", "frun.out", "panther.*"):
+        for f in staging.glob(patt):
+            f.unlink()
 
     # --- dv template + parameters ---
     (staging / "dv.dat.tpl").write_text(

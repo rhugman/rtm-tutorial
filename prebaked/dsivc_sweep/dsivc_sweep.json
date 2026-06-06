@@ -1,0 +1,14 @@
+{
+  "artifact": "DSIVC training sweep (thinned)",
+  "produced_by": "etc/make_prebaked.py",
+  "source_dir": "master_sweep",
+  "git_sha": "01d975ea577d1c45b2d710e8db86221d884d4df1",
+  "thinned_to_n_obs": 29434,
+  "n_realisations": 133,
+  "generated_on": "2026-06-07",
+  "hardware": "TODO: e.g. MacBook Pro M2, 16 GB",
+  "walltime_hours": null,
+  "run_date": "TODO: date the underlying ensemble was actually run",
+  "cost_note": "~6 min per forward model run; full prior MC is ~201 runs",
+  "notes": "posterior parameter fields (full-model IES iteration 1) x one decision-variable draw each: dv-rate-mult U[0.25,2], dv-switch-day U[308,500] (well activates at first SP start >= switch day); base row = canonical operation (1.0, 308). Curated-set control file: prebaked/pest.pst (no dv params -- part1_08 attaches them)."
+}
