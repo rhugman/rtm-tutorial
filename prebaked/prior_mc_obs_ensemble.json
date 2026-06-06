@@ -1,10 +1,10 @@
 {
   "artifact": "prior_mc_obs_ensemble",
   "produced_by": "etc/make_prebaked.py",
-  "source_dir": "/Users/ruihugman/GitHub/rtm-tutorial/master_priormc",
-  "git_sha": "824414767bfd158e9b3d37ce7e07567bccb2dc7b",
+  "source_dir": "master_priormc_v2",
+  "git_sha": "31770bee218660d7f8b18399b73c9b206f8cfcef",
   "thinned_to_n_obs": 29434,
-  "n_realisations": 195,
+  "n_realisations": 198,
   "generated_on": "2026-06-06",
   "hardware": "TODO: e.g. MacBook Pro M2, 16 GB",
   "walltime_hours": null,
