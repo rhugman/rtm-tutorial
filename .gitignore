@@ -43,3 +43,10 @@ data/mf6_grid.*
 /forward_run.py
 tutorials/**/column/
 tutorials/**/PstFrom.log
+
+# parallel run workers and staging (repo root, transient)
+/worker_*/
+/pst_template_*_stage/
+/master_sweep/
+/master_hm_v2/
+/master_priormc_v2/

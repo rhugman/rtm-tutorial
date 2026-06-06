@@ -406,24 +406,48 @@ def thin_full_model_ies(source_dir, out_dir, obs_csv=None):
 
 
 def build_dsivc_training_sweep(source_dir, out_dir, obs_csv=None):
-    """STUB: build the DSIVC training sweep for part1_08.
+    """Thin the DSIVC training sweep (etc/run_dsivc_sweep.py output) for part1_08.
 
-    TODO (maintainer):
-      * Take the posterior parameter fields from the thinned full-model IES
-        (``thin_full_model_ies`` output) -- these are the fields the decision is
-        made against.
-      * Re-sample the two decision variables (supply-well rate multiplier and
-        switch-on day) across their bounds, independently of the prior, so the
-        decision space is *covered by design* (see CONTEXT.md 'decision
-        problem'): roughly ~200 (posterior field x dvar) combinations.
-      * Run the emulator (NOT the full model) over that design to produce the
-        training table DSIVC consumes, and write it to ``prebaked/dsivc_sweep/``
-        with a provenance sidecar (n runs, dvar bounds, source posterior).
+    Ships: the sweep obs ensemble thinned to the curated obs set; the decision
+    -variable values per realisation (sweep_dvs.csv); and a provenance sidecar.
+    The curated-set control file already ships as ``prebaked/pest.pst``.
     """
-    raise NotImplementedError(
-        "DSIVC training sweep is not implemented yet -- see the TODO in "
-        "build_dsivc_training_sweep(). Requires the full-model IES posterior "
-        "fields and pyemu feat_dsivc."
+    import pandas as pd
+
+    source_dir = Path(source_dir)
+    out = Path(out_dir)
+    if out.name != "dsivc_sweep":
+        out = out / "dsivc_sweep"
+    out.mkdir(parents=True, exist_ok=True)
+
+    pst = pyemu.Pst(str(source_dir / "pest.pst"))
+    pst.try_parse_name_metadata()
+    keep = resolve_curated_obs(pst, obs_csv)
+    oe = pyemu.ObservationEnsemble.from_binary(
+        pst=pst, filename=str(source_dir / "pest.0.obs.jcb"))
+    cols = [c for c in keep if c in oe._df.columns]
+    pyemu.ObservationEnsemble(pst=pst, df=oe._df[cols]).to_binary(
+        str(out / "sweep_obs_ensemble.jcb"))
+    print(f"  sweep obs thinned {oe.shape[1]} -> {len(cols)} "
+          f"({oe.shape[0]} runs)")
+
+    pe = pyemu.ParameterEnsemble.from_binary(
+        pst=pst, filename=str(source_dir / "pest.0.par.jcb"))
+    dvs = pe._df[["dv-rate-mult", "dv-switch-day"]]
+    dvs.to_csv(out / "sweep_dvs.csv")
+    print(f"  decision variables -> sweep_dvs.csv ({dvs.shape[0]} rows; "
+          f"base = canonical operation)")
+
+    write_provenance(
+        out / "dsivc_sweep.json",
+        artifact="DSIVC training sweep (thinned)",
+        source_dir=source_dir, n_obs=len(cols), n_reals=oe.shape[0],
+        notes=("posterior parameter fields (full-model IES iteration 1) x one "
+               "decision-variable draw each: dv-rate-mult U[0.25,2], "
+               "dv-switch-day U[308,500] (well activates at first SP start >= "
+               "switch day); base row = canonical operation (1.0, 308). "
+               "Curated-set control file: prebaked/pest.pst (no dv params -- "
+               "part1_08 attaches them)."),
     )
 
 
@@ -445,12 +469,12 @@ def main(argv=None):
     p.add_argument("--obs-csv", default=None,
                    help="explicit curated obs list (CSV with 'obsnme' col, or one name per line)")
 
-    p = sub.add_parser("full-model-ies", help="thin master_hm IES results (STUB)")
+    p = sub.add_parser("full-model-ies", help="thin master_hm IES results")
     p.add_argument("--source", default=str(REPO_ROOT / "master_hm"))
     p.add_argument("--out", default=str(REPO_ROOT / "prebaked" / "full_model_ies"))
     p.add_argument("--obs-csv", default=None)
 
-    p = sub.add_parser("dsivc-sweep", help="build the DSIVC training sweep (STUB)")
+    p = sub.add_parser("dsivc-sweep", help="thin the DSIVC training sweep")
     p.add_argument("--source", default=str(REPO_ROOT / "master_hm"))
     p.add_argument("--out", default=str(REPO_ROOT / "prebaked" / "dsivc_sweep"))
     p.add_argument("--obs-csv", default=None)
