@@ -1,0 +1,14 @@
+{
+  "artifact": "full-model PESTPP-IES results (thinned)",
+  "produced_by": "etc/make_prebaked.py",
+  "source_dir": "master_hm_v2",
+  "git_sha": "ea589d8510ae2b94ec57f10475a678f31e368563",
+  "thinned_to_n_obs": 7477,
+  "n_realisations": 160,
+  "generated_on": "2026-06-06",
+  "hardware": "MacBook, 16 physical cores, 12 PANTHER workers",
+  "walltime_hours": 9.7,
+  "run_date": "2026-06-06",
+  "cost_note": "~6 min per forward model run; full prior MC is ~201 runs",
+  "notes": "posterior = iteration 1 (best mean actual phi); later iterations diverge (phi rises, realisations fail) and are shipped for the convergence narrative only. Forecast group at every iteration; fit bundle (so4/ph/o0 at welopt-ly3,wp1-f3,wp4-f5) at iterations 0 and 1; posterior par ensemble only (DSIVC foundation)."
+}

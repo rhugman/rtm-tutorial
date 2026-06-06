@@ -52,6 +52,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import shutil
 import subprocess
 import sys
 from datetime import date
@@ -328,25 +329,79 @@ def thin_prior_mc(source_dir, out_dir, obs_csv=None):
 # stubs -- full-model IES and DSIVC sweep (not yet implementable end to end)
 # --------------------------------------------------------------------------- #
 def thin_full_model_ies(source_dir, out_dir, obs_csv=None):
-    """STUB: thin the full-model PESTPP-IES results (master_hm) for 1_06/1_08.
+    """Thin the full-model PESTPP-IES results for part1_06/part1_08.
 
-    TODO (maintainer):
-      * Read ``<source>/pest.pst`` and, for each IES iteration, the par and obs
-        ensembles (``pest.<i>.par.jcb`` / ``pest.<i>.obs.jcb``) plus the
-        ``obs+noise`` ensemble.
-      * Thin the obs ensembles to the same curated obs set used for the prior
-        MC (reuse ``resolve_curated_obs``), and keep the par ensembles whole
-        (they are small relative to the obs ensembles and part1_08 needs the
-        posterior parameter fields for the DSIVC sweep).
-      * Write per-iteration thinned ensembles into ``prebaked/full_model_ies/``
-        with a provenance sidecar (source dir, git SHA, noptmax, n iterations).
-      * Decide which iteration is "the posterior" and record it in provenance
-        so part1_06/part1_08 do not have to guess.
+    Per iteration: the FORECAST-group obs columns (small; carries the peak
+    distribution for every iteration so the convergence/divergence story can
+    be told) plus, for iteration 0 and the best-phi iteration, a "fit bundle"
+    of representative conditioning series (so4/ph/o0 at the supply well and
+    two monitoring sites). Parameter ensembles are copied whole per iteration
+    (part1_08 needs the posterior fields). Provenance records which iteration
+    is "the posterior" (best mean actual phi).
     """
-    raise NotImplementedError(
-        "full-model IES thinning (master_hm) is not implemented yet -- see the "
-        "TODO in thin_full_model_ies(). Implement once part1_06 fixes the "
-        "curated obs set."
+    import glob
+    import pandas as pd
+
+    source_dir = Path(source_dir)
+    out = Path(out_dir)
+    if out.name != "full_model_ies":
+        out = out / "full_model_ies"
+    out.mkdir(parents=True, exist_ok=True)
+
+    pst = pyemu.Pst(str(source_dir / "pest.pst"))
+    pst.try_parse_name_metadata()
+    od = pst.observation_data.copy()
+    od["time"] = od["time"].astype(float)
+
+    fc = forecast_obsnames(pst)
+    fit_sites = ["welopt-ly3", "wp1-f3", "wp4-f5"]
+    fit = od.loc[od.obsid.astype(str).isin(fit_sites)
+                 & od.variable.isin(["so4", "ph", "o0"])].obsnme.tolist()
+
+    phi = pd.read_csv(source_dir / "pest.phi.actual.csv")
+    best_iter = int(phi.loc[phi["mean"].idxmin(), "iteration"])
+    iters = sorted(int(Path(f).name.split(".")[1])
+                   for f in glob.glob(str(source_dir / "pest.*.obs.jcb"))
+                   if Path(f).name.split(".")[1].isdigit())
+    print(f"  iterations on disk: {iters}; best mean-phi iteration: {best_iter}")
+
+    n_reals = {}
+    for it in iters:
+        oe = pyemu.ObservationEnsemble.from_binary(
+            pst=pst, filename=str(source_dir / f"pest.{it}.obs.jcb"))
+        keep = list(dict.fromkeys(fc + (fit if it in (0, best_iter) else [])))
+        keep = [c for c in keep if c in oe._df.columns]
+        thin = oe._df[keep]
+        pyemu.ObservationEnsemble(pst=pst, df=thin).to_binary(
+            str(out / f"hm.{it}.obs.jcb"))
+        if it == best_iter:
+            # only the posterior parameter fields ship (the DSIVC sweep's
+            # foundation); other iterations' par ensembles stay in the master
+            shutil.copy(source_dir / f"pest.{it}.par.jcb",
+                        out / f"hm.{it}.par.jcb")
+        n_reals[it] = thin.shape[0]
+        par_note = " (+ posterior par ensemble copied)" if it == best_iter else ""
+        print(f"  iter {it}: {thin.shape[0]} reals x {len(keep)} obs{par_note}")
+
+    shutil.copy(source_dir / "pest.phi.actual.csv", out / "hm.phi.actual.csv")
+    # a thinned control file restricted to the kept obs (forecast + fit bundle)
+    keep_all = sorted(set(fc).union(fit))
+    tpst = pst.get(obs_names=[o for o in keep_all if o in pst.obs_names],
+                   par_names=pst.par_names)
+    tpst.model_input_data = tpst.model_input_data.iloc[0:0]
+    tpst.model_output_data = tpst.model_output_data.iloc[0:0]
+    tpst.write(str(out / "hm.pst"), version=2)
+    write_provenance(
+        out / "full_model_ies.json",
+        artifact="full-model PESTPP-IES results (thinned)",
+        source_dir=source_dir, n_obs=len(keep_all),
+        n_reals=n_reals.get(best_iter, 0),
+        notes=(f"posterior = iteration {best_iter} (best mean actual phi); "
+               f"later iterations diverge (phi rises, realisations fail) and "
+               f"are shipped for the convergence narrative only. Forecast "
+               f"group at every iteration; fit bundle (so4/ph/o0 at "
+               f"{','.join(fit_sites)}) at iterations 0 and {best_iter}; "
+               f"posterior par ensemble only (DSIVC foundation)."),
     )
 
 
