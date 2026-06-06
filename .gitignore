@@ -20,6 +20,7 @@ tutorials/**/workspace*/
 tutorials/**/model/
 tutorials/**/full_model_*/
 tutorials/**/*_sweep/
+tutorials/**/dw_*/
 
 # --- root-level legacy generated dirs (expensive run results; not tracked) ---
 model/

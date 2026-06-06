@@ -67,6 +67,7 @@ HISTORY_END = 252      # decision date: last day usable for conditioning
 SUPPLY_START = 308     # supply well switches on
 SUPPLY_END = 728       # end of the supply period
 COND_SPECIES = ["so4", "o0", "no3", "ph", "tmp"]   # conditioning species (O2 == 'o0')
+HELDBACK_SPECIES = ["ca", "na", "fe", "fe2"]       # held-back cations (the dataworth question; mg/k not simulated)
 SUPPLY_SCREENS = ["welopt-ly1", "welopt-ly3", "welopt-ly5"]   # ALL supply-well screens; the forecast is the max over every one
 FORECAST_SPECIES = "so4"
 N_REALS_TARGET = 201   # realisations drawn and kept (a handful fail, as ensembles do)
@@ -150,7 +151,19 @@ def curated_obs_from_part1_03(pst):
     p3.try_parse_name_metadata()
     od = p3.observation_data
     cond = od.loc[od.weight > 0].obsnme.tolist()
-    keep = sorted(set(cond).union(forecast_obsnames(p3)))
+    # the held-back cations ride along at the same sites/window: part1_07's
+    # dataworth question ("would measuring these have helped?") needs their
+    # series in the shipped ensemble even though nothing conditions on them
+    od2 = od.copy()
+    od2["time"] = od2["time"].astype(float)
+    cond_sites = set(od.loc[od.weight > 0, "obsid"].astype(str))
+    # fortnightly stride: a lab campaign, not a sensor -- and it keeps the
+    # shipped artifact under git-friendly size
+    hb = od2.loc[od2.variable.isin(HELDBACK_SPECIES)
+                 & od2.obsid.astype(str).isin(cond_sites)
+                 & (od2.time <= HISTORY_END)
+                 & (od2.time % 14 < 0.5)].obsnme.tolist()
+    keep = sorted(set(cond).union(hb).union(forecast_obsnames(p3)))
     return keep
 
 
