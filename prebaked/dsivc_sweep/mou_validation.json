@@ -1,0 +1,17 @@
+{
+  "artifact": "DSIVC optimum full-model validation",
+  "produced_by": "etc/run_dsivc_mou_validation.py",
+  "git_sha": "69d521003af000ffaa4141dff08dcf11ab3422a4",
+  "generated_on": "2026-07-05",
+  "base_field": "base",
+  "decvars": {
+    "dv-rate-ly1": 2.0,
+    "dv-rate-ly3": 2.0,
+    "dv-rate-ly5": 2.0,
+    "dv-switch-day": 308.0
+  },
+  "n_obs": 29434,
+  "peak_so4_molL": 0.000822371,
+  "peak_so4_mgL": 79.0,
+  "notes": "base posterior field run through the full reactive-transport model at the DSIVC-recommended plan (per-screen vertical rate split + switch-on) -- a held-out decision (the field's sweep run was the canonical 1/1/1, 308). Compared in part1_08 against the DSIVC-conditioned forecast distribution there."
+}

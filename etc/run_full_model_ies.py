@@ -9,14 +9,17 @@ part1_08 DSIVC training sweep.
 What it stages
 --------------
 * template: the part1_02 ``pst_template`` (15,025 pars incl. ``pyr-lograte``)
-* truth: the part1_03 pick (87.5th percentile of the prior peak; pass
+* truth: the part1_03 pick (75th percentile of the prior peak; pass
   ``--truth`` to override) — its obs values become the conditioning targets,
   and its realisation is DROPPED from the prior parameter ensemble
-* weights: part1_03's staged canonical noise model (species sigmas, stored
-  units, sqrt(n)-per-series deflation) — measurement error only; the full
-  model needs no emulator-error allowance
-* noise: correlated within each site:species series (one draw per
-  realisation per series, scaled by each obs's own sigma)
+* weights: part1_03's staged canonical noise model (species sigmas in stored
+  units, weight = 1/sigma) — measurement error only; the full model needs no
+  emulator-error allowance
+* phi: balanced per site:species group (equal share), the same per-species
+  rebalancing part1_03/part1_05 use to stop a long series over-counting
+* noise: correlated within each site:species series (one draw per realisation
+  per series, scaled per-time by each obs's sigma), concentrations truncated
+  at zero (physical bounds)
 * solver: default IES, ``noptmax=3``, no multimodal options (deliberate; see
   part1_05's evidence beat)
 
@@ -35,6 +38,7 @@ import sys
 from pathlib import Path
 
 import numpy as np
+import pandas as pd
 import psutil
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -44,8 +48,8 @@ import pyemu  # noqa: E402
 TEMPLATE = REPO_ROOT / "tutorials" / "part1_02_pstfrom_setup" / "pst_template"
 STAGED_13 = (REPO_ROOT / "tutorials" / "part1_03_obs_weights_and_truth"
              / "obs_template" / "pest.pst")
-PRIOR_MASTER = REPO_ROOT / "master_priormc_v2"
-TRUTH_PCTILE = 0.875
+PRIOR_MASTER = REPO_ROOT / "master_priormc"
+TRUTH_PCTILE = 0.75
 NOISE_SEED = 20260606
 
 
@@ -89,6 +93,16 @@ def main():
         w3.loc[common, "standard_deviation"]
     nz = pst.observation_data.loc[pst.observation_data.weight > 0]
     print(f"weights: {len(nz)} conditioning obs from part1_03's staged canon")
+
+    # --- balance phi per site:species group (equal share), as part1_03 does ---
+    od = pst.observation_data
+    od.loc[nz.index, "obgnme"] = (od.loc[nz.index, "obsid"].astype(str) + ":"
+                                  + od.loc[nz.index, "variable"].astype(str))
+    wgroups = od.loc[od.weight > 0, "obgnme"].unique()
+    phi_factors = pd.Series(1.0 / len(wgroups), index=wgroups)
+    phi_factors.to_csv(staging / "ies_phi_factors.csv", header=False)
+    pst.pestpp_options["ies_phi_factor_file"] = "ies_phi_factors.csv"
+    print(f"phi factors: {len(wgroups)} site:species groups, equal share")
 
     # --- truth values: pick from the SAME artifact part1_03 uses (the thinned
     # prebaked ensemble), so the pick matches the notebooks by construction;
@@ -136,15 +150,16 @@ def main():
     noise = pyemu.ObservationEnsemble.from_gaussian_draw(
         pst, num_reals=pe.shape[0])
     rng = np.random.default_rng(NOISE_SEED)
+    ABS_SPECIES = {"ph", "tmp"}   # absolute-sigma species; the rest are concentrations
     series = nzobs.obsid.astype(str) + ":" + nzobs.variable.astype(str)
     for grp in series.unique():
         g = nzobs.loc[series == grp]
         z = rng.standard_normal(noise.shape[0])
-        noise.loc[:, g.index] = (g.obsval.values[None, :]
-                                 + z[:, None]
-                                 * g.standard_deviation.values[None, :])
-    zero_obs = nzobs.loc[nzobs.obsval == 0].index
-    noise.loc[:, zero_obs] = 0.0
+        vals = (g.obsval.values[None, :]
+                + z[:, None] * g.standard_deviation.values[None, :])
+        if grp.split(":")[-1] not in ABS_SPECIES:   # concentrations stay >= 0
+            np.clip(vals, 0.0, None, out=vals)
+        noise.loc[:, g.index] = vals
     noise._df = noise._df.dropna(axis=1)
     noise.to_binary(str(staging / "noise_hm.jcb"))
 
