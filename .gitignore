@@ -50,3 +50,24 @@ tutorials/**/PstFrom.log
 /master_sweep/
 /master_hm_v2/
 /master_priormc_v2/
+
+# workflow prototype scaffolding
+_workflow/_figs/
+_workflow/__pycache__/
+_workflow/_s2_model/
+_workflow/_s2_pristine/
+_workflow/_s3_template/
+_workflow/_s3_stage/
+_workflow/_s2_model/
+_workflow/_s2_pristine/
+_workflow/_s5_master/
+_workflow/_s5_workers/
+_workflow/_truth/
+_workflow/_truth_props/
+_workflow/_s6_dsi_template/
+_workflow/_s6_loo_dsi/
+_workflow/_s6_fig_*/
+# catch-all for every generated workspace (mothership): _s2/_s3/_s5/_s6*/_s7* + scratch
+_workflow/_s*/
+_workflow/_treat_scratch/
+_workflow/_s5_master_snap*/
