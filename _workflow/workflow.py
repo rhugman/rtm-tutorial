@@ -29,6 +29,14 @@ gate on convergence + mass balance (a maintainer / human step, not CI).
 """
 
 import os
+
+# macOS/conda duplicate-OpenMP guard: numpy/scipy and PhreeqcRM each ship a libomp, and PhreeqcRM's
+# init (the in-python f_treat chemistry build) aborts with "OMP Error #15 ... already initialized"
+# when two copies are linked. Set before any numeric/PhreeqcRM import so the whole arc + the in-worker
+# treatment survive it. Safe here because the copies are the same conda-forge libomp; if you ever see
+# suspect reactive results, dedupe libomp in the env instead of relying on this. Respect a user override.
+os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
+
 import re
 import sys
 import glob
