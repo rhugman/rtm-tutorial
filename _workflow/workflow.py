@@ -3252,16 +3252,21 @@ def merge_training_data(prior_master=WS5_MASTER, prior_template=WS3,
 
 def build_dsivc(merged=None, dsivc_template=WS7_DSIVC, runstore=WS7_DSIVC_RUNSTORE, template_ws=WS3,
                 model_ws=WS, truth_dir=None, seed=20260706, so4_pct=0.95, inner_noptmax=3,
-                mou_pop=40, mou_gens=20, num_reals=300):
+                mou_pop=40, mou_gens=20, num_reals=300, cond_on_data=False):
     """DSIVC outer optimization over the merged-trained DSI emulator: minimize treatment COST vs
     minimize P<so4_pct> peak recovered-SO4, decision variable f_treat.
 
     (a) fit the DSI on the merged (prior + sweep) training set -- f_treat + fore_peak_so4 are obs columns
     (b) runstore-prepare the emulator (dsi.pst + dsi.pickle + fwd run)
-    (c) set the BASELINE-TRUTH conditioning on the inner dsi.pst (targets from _truth + proportional
-        1/obs_sigma weights + per-site:species phi factors) + a correlated obs-noise ensemble DSIVC
-        harvests (dsi.obs+noise.jcb), so every inner run conditions on the monitored data AND the
-        injected f_treat
+    (c) configure the inner dsi.pst conditioning + the obs-noise ensemble DSIVC harvests
+        (dsi.obs+noise.jcb). Two modes:
+          * cond_on_data=False (DEFAULT) -- DECVAR-ONLY: every monitored obs stays zero-weight, so each
+            inner run conditions ONLY on the injected f_treat (DSIVC weights the decvar). The stack at a
+            candidate is then the prior-predictive recovered-SO4 GIVEN that treatment level -- i.e. the
+            ground-truth sweep slice, isolating the f_treat effect from any history-matching interaction.
+          * cond_on_data=True -- baseline-truth conditioning on the monitored data too (targets from
+            _truth + proportional 1/obs_sigma weights + per-site:species groups + correlated noise), so
+            every inner run conditions on the measured data AND f_treat.
     (d) DSIVC.prepare_pestpp(decvar=f_treat, percentiles=(1-so4_pct, so4_pct)) -> outer dsivc.pst
     (e) wire the EXACT cost as a 2nd model command (compute_cost.py + v_inj.dat) -> `cost` obs
     (f) declare objectives: min cost + min fore_peak_so4_stat:<pct>% (obs group 'less_than', non-zero
@@ -3285,32 +3290,37 @@ def build_dsivc(merged=None, dsivc_template=WS7_DSIVC, runstore=WS7_DSIVC_RUNSTO
     dpst = dsi.prepare_pestpp(str(runstore), use_runstor=True)
     hbd.get_bins(str(runstore))
 
-    # (c) baseline-truth conditioning on the inner dsi.pst (mirrors build_dsi_conditioning; truth from _truth)
-    ometa = _dsi_meta(pyemu.Pst(str(template_ws / "pest.pst")))          # lowercased index + variable
-    tvals = pd.read_csv(truth_dir / "truth_obs.csv", index_col=0)["obsval"]
-    tvals.index = tvals.index.astype(str).str.lower()
+    # (c) inner dsi.pst conditioning. Every monitored obs starts zero-weight; cond_on_data adds the
+    #     baseline-truth conditioning on top. DSIVC weights the f_treat decvar itself (decvar_weight).
     dobs = dpst.observation_data
     dobs["weight"] = 0.0
     dobs["standard_deviation"] = np.nan
-    cond = [o for o in dpst.obs_names if o in ometa.index
-            and float(ometa.loc[o, "weight"]) > 0 and o in tvals.index]
-    cm = ometa.loc[cond]
-    species = np.where(cm["obgnme"].values == "head", "head", cm["variable"].astype(str).values)
-    ovals = tvals[cond].astype(float).values
-    sig = np.array([float(obs_sigma(np.array([v]), s)[0]) for v, s in zip(ovals, species)])
-    dobs.loc[cond, "obsval"] = ovals
-    dobs.loc[cond, "standard_deviation"] = sig
-    dobs.loc[cond, "weight"] = 1.0 / sig
-    dobs.loc[cond, "obgnme"] = [f"{oid}:{s}" for oid, s in zip(cm["obsid"].astype(str).values, species)]
-    groups = pd.unique(dobs.loc[cond, "obgnme"])
+    if cond_on_data:                       # condition on the monitored data too (mirrors build_dsi_conditioning)
+        ometa = _dsi_meta(pyemu.Pst(str(template_ws / "pest.pst")))      # lowercased index + variable
+        tvals = pd.read_csv(truth_dir / "truth_obs.csv", index_col=0)["obsval"]
+        tvals.index = tvals.index.astype(str).str.lower()
+        cond = [o for o in dpst.obs_names if o in ometa.index
+                and float(ometa.loc[o, "weight"]) > 0 and o in tvals.index]
+        cm = ometa.loc[cond]
+        species = np.where(cm["obgnme"].values == "head", "head", cm["variable"].astype(str).values)
+        ovals = tvals[cond].astype(float).values
+        sig = np.array([float(obs_sigma(np.array([v]), s)[0]) for v, s in zip(ovals, species)])
+        dobs.loc[cond, "obsval"] = ovals
+        dobs.loc[cond, "standard_deviation"] = sig
+        dobs.loc[cond, "weight"] = 1.0 / sig
+        dobs.loc[cond, "obgnme"] = [f"{oid}:{s}" for oid, s in zip(cm["obsid"].astype(str).values, species)]
+    else:                                  # DECVAR-ONLY: no monitored-data conditioning (f_treat is the only target)
+        cond = []
+    groups = pd.unique(dobs.loc[cond, "obgnme"]) if cond else np.array([], dtype=object)
     # NB: no ies_phi_factor_file here -- DSIVC weights the f_treat decvar (a DSI-default group not in the
     # file), which pestpp would reject; the per-obs 1/sigma weights already balance the conditioning.
     dpst.pestpp_options["ies_drop_conflicts"] = True
     dpst.pestpp_options.pop("ies_autoadaloc", None)
     dpst.control_data.noptmax = inner_noptmax
     dpst.write(str(runstore / "dsi.pst"), version=2)
-    # correlated obs-noise ensemble DSIVC harvests: one shock per site:species series per realization.
-    # fill=True keeps ALL obs as columns (incl. the zero-weight f_treat decvar), which DSIVC requires.
+    # obs-noise ensemble DSIVC harvests: fill=True keeps ALL obs as columns (incl. the zero-weight f_treat
+    # decvar), which DSIVC requires. With decvar-only conditioning every monitored obs is zero-weight, so
+    # the correlated-shock loop is a no-op and the harvested noise is inert on the measured obs.
     noise = pyemu.ObservationEnsemble.from_gaussian_draw(dpst, num_reals=num_reals, fill=True)
     rng = np.random.default_rng(seed)
     for grp, g in dobs.loc[cond].groupby("obgnme"):
@@ -3357,8 +3367,10 @@ def build_dsivc(merged=None, dsivc_template=WS7_DSIVC, runstore=WS7_DSIVC_RUNSTO
     pst.pestpp_options["mou_save_population_every"] = 1
     pst.control_data.noptmax = mou_gens                       # NSGA-II generations (0 = setup only)
     pst.write(str(dsivc_template / "dsivc.pst"), version=2)
+    cond_desc = f"{len(cond)} monitored obs / {len(groups)} phi groups + f_treat" if cond_on_data \
+        else "DECVAR-ONLY (f_treat)"
     print(f"  [build_dsivc] DSI(merged {merged.shape[0]}x{merged.shape[1]}) -> DSIVC decvar=f_treat; "
-          f"{len(cond)} conditioning obs / {len(groups)} phi groups; objectives min({', '.join(objs)}); "
+          f"conditioning: {cond_desc}; objectives min({', '.join(objs)}); "
           f"inner noptmax={inner_noptmax}, mou_pop={mou_pop}, V_inj={v_inj:.3e}. Deploy: run_dsivc_mou.")
     return pst
 
@@ -3445,6 +3457,11 @@ if __name__ == "__main__":
         run_dsivc_sweep()
     elif "--stage7merge" in sys.argv:                        # merge + leverage gate (after sweep lands)
         merge_training_data()
+    elif "--stage7build" in sys.argv:                        # (re)build DSIVC only (reuse the landed sweep)
+        _merged, _ = merge_training_data()
+        build_dsivc(_merged, cond_on_data="--cond-on-data" in sys.argv)
+    elif "--stage7mou" in sys.argv:                          # deploy the DSIVC pestpp-mou run only
+        run_dsivc_mou()
     elif "--stage7" in sys.argv:
         stage7_dsivc()
     elif "--reinflate" in sys.argv:                          # test reinflation on failed LOO xvals
