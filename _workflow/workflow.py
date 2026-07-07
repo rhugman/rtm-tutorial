@@ -1409,7 +1409,9 @@ def build_pest_interface(model_ws=WS, template_ws=WS3, num_reals=N_REALS, with_t
     if with_treatment:                                                # PRE: f_treat -> treated wellin aux + cost
         pf.add_py_function(wf_py, "apply_treatment_forward()", is_pre_cmd=True)
     pf.add_py_function(hbd_py, "copy_parameterized_transport_files()", is_pre_cmd=True)  # PRE
-    pf.mod_sys_cmds.append("mf6rtm")
+    # capture the model stdout/stderr (os_utils.run uses os.system -> shell redirect works) so the
+    # OMP/mf6rtm crash message survives on a worker and can be shipped back via panther_transfer_on_fail
+    pf.mod_sys_cmds.append("mf6rtm > mf6rtm.stdout 2>&1")
     pf.add_py_function(hbd_py, "process_sim_conc()", is_pre_cmd=False)  # POST: conditioning obs
     pf.add_py_function(wf_py, "process_forecast()", is_pre_cmd=False)   # POST: recovered-SO4 forecast
     pf.add_py_function(wf_py, "process_heads()", is_pre_cmd=False)      # POST: monitoring head series
@@ -1475,6 +1477,9 @@ def build_pest_interface(model_ws=WS, template_ws=WS3, num_reals=N_REALS, with_t
     fore_names = obs.loc[obs.obgnme == "forecast", "obsnme"].tolist()
     pst.pestpp_options["forecasts"] = ",".join(fore_names)
     pst.pestpp_options["ies_num_reals"] = num_reals
+    # PANTHER: on a FAILED run, ship these diagnostic files from the worker back to the master so a
+    # remote/worker crash (e.g. the mf6rtm OMP abort) can be inspected without shell access to the slot.
+    pst.pestpp_options["panther_transfer_on_fail"] = "mf6rtm.stdout,mfsim.lst,gwf.lst"
     pst.control_data.noptmax = 0
     pst.write(str(template_ws / "pest.pst"), version=2)
     return pf, pst
