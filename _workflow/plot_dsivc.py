@@ -378,10 +378,15 @@ def render_loop_frames(loop_dir=None, per_gen=True, freeze_axes=True):
             except (FileNotFoundError, KeyError) as e:
                 print(f"  [frames] skip {it.name} gen={g}: {e}")
     fdir = frames[0].parent if frames else base / "_figs" / STAGE / "frames"
-    print(f"[frames] {len(frames)} frames in {fdir}\n"
-          f"  GIF:  ffmpeg -y -framerate 4 -i {fdir}/frame_%03d.png -vf palettegen /tmp/pal.png && \\\n"
-          f"        ffmpeg -y -framerate 4 -i {fdir}/frame_%03d.png -i /tmp/pal.png "
-          f"-lavfi paletteuse {fdir}/loop.gif")
+    if frames:
+        try:
+            from PIL import Image
+            imgs = [Image.open(f).convert("RGB") for f in frames]
+            gif = fdir / "loop.gif"
+            imgs[0].save(gif, save_all=True, append_images=imgs[1:], duration=600, loop=0)
+            print(f"[frames] {len(frames)} frames + GIF -> {gif}")
+        except ImportError:
+            print(f"[frames] {len(frames)} frames in {fdir} (Pillow absent; assemble the GIF manually)")
     return frames
 
 
