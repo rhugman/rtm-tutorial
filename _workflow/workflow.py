@@ -3611,10 +3611,12 @@ def _fom_training_rows(master_dir, sweep_template=WS7_SWEEP, s3_template=WS3, in
 
 def build_infill_par_ensemble(dv_points, K, iter_k, out_path, prior_pe_path=WS3 / "prior_pe.jcb",
                               sweep_template=WS7_SWEEP, s3_template=WS3, seed=20260707):
-    """Paired-CRN infill par ensemble: draw ONE random K-subset of prior_pe (rotated by iter_k so the
-    whole ensemble is covered over the loop) and replicate it across the infill DECVAR VECTORS, injecting
-    each vector -> (n_points*K) reals. Same params at every point = common random numbers = a clean
-    decvar-response per realization (minimum-variance cov(decvars, forecast) for the DSI).
+    """DISPERSED infill par ensemble: draw n_points*K DISTINCT prior_pe realizations (rotated by iter_k)
+    and give each decvar point its OWN fresh K-subset -- NO parameter realization is reused across decvar
+    points. This spreads the (parameter x decvar) samples widely over the joint space, so the data-space
+    DSI sees many distinct parameter draws rather than the same K repeated at every point (the old
+    paired-CRN design gave a clean per-decvar gradient but sampled only K parameter sets). Sampled without
+    replacement while the ensemble allows.
 
     ``dv_points`` : a DataFrame (n_points x n_decvars) of Pareto-optimal decvar combos (f_treat + any
     per-screen toggles). Every listed decvar is injected per point; a scalar/array of f_treat is also
@@ -3625,28 +3627,31 @@ def build_infill_par_ensemble(dv_points, K, iter_k, out_path, prior_pe_path=WS3 
     if not isinstance(dv_points, pd.DataFrame):                 # back-compat: a list/array of f_treat locs
         dv_points = pd.DataFrame({"f_treat": np.asarray(dv_points, float)})
     base = pyemu.ParameterEnsemble.from_binary(pst=pst_s3, filename=str(prior_pe_path))._df
+    n_pts = len(dv_points)
+    n_need = n_pts * K
     rng = np.random.default_rng(seed + iter_k)
-    idx = rng.choice(np.asarray(base.index), size=min(K, base.shape[0]), replace=False)
-    sub = base.loc[idx]
+    # distinct param reals, one disjoint K-block per decvar point (no reuse across points)
+    idx = rng.choice(np.asarray(base.index), size=n_need, replace=(n_need > base.shape[0]))
     rows = []
     for j, (_, dvrow) in enumerate(dv_points.reset_index(drop=True).iterrows()):
-        r = sub.copy()
+        sub = base.loc[idx[j * K:(j + 1) * K]].copy()          # this point's OWN param subset
         for dv, val in dvrow.items():                          # inject ALL decvars (f_treat + screens)
-            r[dv] = float(val)
-        r.index = [f"it{iter_k}_l{j}_r{ri}" for ri in range(sub.shape[0])]
-        rows.append(r)
+            sub[dv] = float(val)
+        sub.index = [f"it{iter_k}_l{j}_r{ri}" for ri in range(sub.shape[0])]
+        rows.append(sub)
     df = pd.concat(rows, axis=0).loc[:, list(pst_sw.par_names)]
     pe = pyemu.ParameterEnsemble(pst=pst_sw, df=df)
     pe.enforce()
+    n_distinct = len(set(idx.tolist()))
     pe.to_binary(str(out_path))
-    print(f"  [infill_pe] iter {iter_k}: {len(dv_points)} decvar points x {sub.shape[0]} params "
-          f"({', '.join(dv_points.columns)}) = {pe.shape[0]} reals -> {Path(out_path).name}")
+    print(f"  [infill_pe] iter {iter_k}: {n_pts} decvar points x {K} params = {pe.shape[0]} reals "
+          f"({n_distinct} distinct param draws, no reuse across points) -> {Path(out_path).name}")
     return pe
 
 
 def run_fom_infill(pe_path, master_dir, num_workers, template_ws=WS7_SWEEP, condor_kwargs=None):
-    """Run one FOM infill wave: the paired-CRN ensemble through the SAME with_treatment sweep interface
-    (pestpp-ies noptmax=-1), deployed to condor/local like run_dsivc_sweep. Writes to master_dir."""
+    """Run one FOM infill wave: the dispersed (param x decvar) ensemble through the SAME with_treatment
+    sweep interface (pestpp-ies noptmax=-1), deployed to condor/local like run_dsivc_sweep -> master_dir."""
     import pyemu
     template_ws, master_dir = Path(template_ws), Path(master_dir)
     pe_name = Path(pe_path).name
