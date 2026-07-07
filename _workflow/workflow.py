@@ -3710,10 +3710,12 @@ def run_all(num_reals=N_PRIOR_MC, num_workers=None, condor_kwargs=None, quantile
           lambda: stage4_truth_weights(quantile=quantile))
     _step("stage 6 -- DSI condition + cross-validation + figures", figs / "06_dsi" / "dsi_forecast.png",
           lambda: regen_figs())
-    _step("stage 6-FOM -- full-model IES history match", WS_FOM_MASTER / "pest.0.obs.jcb",
-          lambda: stage6_fom(num_workers=num_workers, condor_kwargs=condor_kwargs))
     _step("stage 7 -- DSIVC f_treat sweep + merge + optimizer", WS7_SWEEP_MASTER / "pest.0.obs.jcb",
           lambda: stage7_dsivc(num_workers=num_workers, condor_kwargs=condor_kwargs))
+    # FOM (full-model IES) conditioning runs LAST -- it is the expensive independent cross-check of the
+    # emulator, not a prerequisite of any downstream stage, so it should not block the DSIVC arc.
+    _step("stage 6-FOM -- full-model IES history match", WS_FOM_MASTER / "pest.0.obs.jcb",
+          lambda: stage6_fom(num_workers=num_workers, condor_kwargs=condor_kwargs))
     print(f"\n{'=' * 72}\n[run_all] DONE -- full DIZON arc complete\n{'=' * 72}", flush=True)
 
 

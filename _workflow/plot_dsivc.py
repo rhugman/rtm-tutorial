@@ -126,8 +126,6 @@ def fig_dsivc_front(master_dir):
     a1.fill_between(s["f_treat"], s[P5], s[P95], color=ROLE["posterior"], alpha=0.22,
                     label="P5–P95 risk band")
     a1.plot(s["f_treat"], s[PMEAN], color=ROLE["posterior"], lw=2, label="posterior mean")
-    if tpk is not None:
-        a1.axhline(tpk, color=ROLE["truth"], ls="--", lw=1.4, label=f"truth ({tpk:.0f})")
     a1.set_xlabel(LBL["ftreat"])
     a1.set_ylabel("peak recovered SO$_4$ (mg/L)")
     a1.set_title("Recovered-SO$_4$ risk band vs treatment", fontsize=12)
@@ -177,9 +175,6 @@ def fig_sweep_tradeoff(sweep_master, sweep_template):
     #     (y, param-scattered), coloured by the decision lever f_treat. Direct analog of the DSIVC front.
     sc = a0.scatter(s["cost"], s["peak_so4"], c=s["f_treat"], cmap="viridis", s=34,
                     edgecolor="none", alpha=0.8, zorder=4)
-    if tpk is not None:
-        a0.axhline(tpk, color=ROLE["truth"], ls="--", lw=1.4, label=f"truth ({tpk:.0f})")
-        a0.legend(fontsize=9, loc="upper right")
     cb = fig.colorbar(sc, ax=a0)
     cb.set_label("$f_{treat}$ (treatment fraction)")
     a0.set_xlabel(LBL["cost"])
@@ -191,8 +186,6 @@ def fig_sweep_tradeoff(sweep_master, sweep_template):
     z = np.polyfit(s["f_treat"], s["peak_so4"], 1)
     r = s["f_treat"].corr(s["peak_so4"])
     a1.plot(ff, np.polyval(z, ff), color=ROLE["emulated"], lw=2.2, label=f"trend (corr = {r:.2f})")
-    if tpk is not None:
-        a1.axhline(tpk, color=ROLE["truth"], ls="--", lw=1.4, label=f"truth ({tpk:.0f})")
     a1.set_xlabel(LBL["ftreat"])
     a1.set_ylabel("peak recovered SO$_4$ (mg/L)")
     a1.legend(fontsize=8, loc="upper right")
@@ -230,9 +223,6 @@ def _draw_overlay(fig, a0, a1, cloud, arc, tpk, cloud_label="full-model sweep",
                    edgecolor="k", linewidth=0.5, zorder=9)
         hh.append(Line2D([], [], color="red", marker="*", ls="none", mec="k", mew=0.5,
                          label=f"new FOM samples (n={len(new_pts)})"))
-    if tpk is not None:
-        a0.axhline(tpk, color=ROLE["truth"], ls="--", lw=1.4)
-        hh.append(Line2D([], [], color=ROLE["truth"], ls="--", lw=1.4, label=f"truth ({tpk:.0f})"))
     a0.set_xlabel(LBL["cost"])
     a0.set_ylabel("peak recovered SO$_4$ (mg/L)")
     a0.legend(handles=hh, fontsize=8, loc="upper right")
@@ -254,9 +244,6 @@ def _draw_overlay(fig, a0, a1, cloud, arc, tpk, cloud_label="full-model sweep",
                    edgecolor="k", linewidth=0.5, zorder=9)
         hh1.append(Line2D([], [], color="red", marker="*", ls="none", mec="k", mew=0.5,
                           label=f"new FOM samples (n={len(new_pts)})"))
-    if tpk is not None:
-        a1.axhline(tpk, color=ROLE["truth"], ls="--", lw=1.4)
-        hh1.append(Line2D([], [], color=ROLE["truth"], ls="--", lw=1.4, label=f"truth ({tpk:.0f})"))
     a1.set_xlabel(LBL["ftreat"])
     a1.set_ylabel("peak recovered SO$_4$ (mg/L)")
     a1.legend(handles=hh1, fontsize=8, loc="upper right")
