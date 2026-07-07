@@ -1737,7 +1737,7 @@ def draw_prior_ensemble(pf, num_reals, template_ws=WS3, seed=20260706):
 # + template (~0.25 GB) + full reactive outputs (sout.csv ~1.6 GB + *.ucn ~0.37 GB + cbb/hds) ~2.1 GB +
 # tarball/headroom -> 8 GB. Reactive transport is spiky + HTCondor evicts over-limit jobs, so err generous.
 # 60 workers, 1 cpu each. Overridable per-run via condor_kwargs.
-CONDOR_DEFAULTS = {"n_workers": 60, "memory_mb": 4096, "disk_mb": 8192, "cpus_per_worker": 1}
+CONDOR_DEFAULTS = {"n_workers": 56, "memory_mb": 4096, "disk_mb": 8192, "cpus_per_worker": 1}
 
 
 def _htcondor_available():
@@ -1810,7 +1810,7 @@ def _deploy_pestpp(template_ws, pst_name, master_dir, num_workers, worker_root,
     if _htcondor_available():
         from condor_deploy import submit_condor_workers_from_env
         _configure_condor()
-        kw = dict(CONDOR_DEFAULTS)                          # n_workers=60, memory/disk/cpus from measured usage
+        kw = dict(CONDOR_DEFAULTS)                          # n_workers=56 (pool size), memory/disk/cpus from usage
         kw["pestpp_exe"] = pestpp_exe
         kw.update(condor_kwargs or {})                     # per-run overrides win
         if not kw.get("env_zip"):                          # automatic --build-env if the zip is absent
