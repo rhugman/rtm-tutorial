@@ -1614,6 +1614,14 @@ def draw_prior_ensemble(pf, num_reals, template_ws=WS3, seed=20260706):
 # as before. Auto-routing on ``condor_submit`` availability keeps local behaviour unchanged off-cluster.
 
 
+# Default HTCondor slot request for the FOM ensembles, grounded in MEASURED single-run usage (2026-07-07):
+# peak mf6rtm RSS ~1.8 GB -> 4 GB memory (~2.2x headroom); per-slot disk = unpacked conda-pack env (~1.6 GB)
+# + template (~0.25 GB) + full reactive outputs (sout.csv ~1.6 GB + *.ucn ~0.37 GB + cbb/hds) ~2.1 GB +
+# tarball/headroom -> 8 GB. Reactive transport is spiky + HTCondor evicts over-limit jobs, so err generous.
+# 60 workers, 1 cpu each. Overridable per-run via condor_kwargs.
+CONDOR_DEFAULTS = {"n_workers": 60, "memory_mb": 4096, "disk_mb": 8192, "cpus_per_worker": 1}
+
+
 def _htcondor_available():
     """True iff an HTCondor pool is reachable (``condor_submit`` on PATH) AND condor_deploy imports."""
     import shutil as _sh
@@ -1633,7 +1641,7 @@ def _configure_condor():
     from condor_deploy import configure
     configure(
         worker_pip_editable=[str(DEPS / d) for d in ("flopy", "pyemu", "mf6rtm", "vorflow")],
-        worker_chmod_exes=["mf6", "pestpp-ies", "libmf6.so", "mf6rtm", "gridgen"],
+        worker_chmod_exes=["mf6", "pestpp-ies", "pestpp-mou", "libmf6.so", "mf6rtm", "gridgen"],
         zip_exclude=["*.ucn", "*.hds", "*.cbb", "*.cbc", "sout.csv", "*.lst", "*.list"],
         platform_requirements='( (OpSys == "LINUX") )',
         worker_python_version="3.12",
@@ -1656,25 +1664,28 @@ def _ensure_env_zip():
     return env_zip
 
 
-def _deploy_fom_pestpp(template_ws, pst_name, master_dir, num_workers, worker_root,
-                       condor_kwargs=None):
-    """Run a FOM pestpp ensemble over workers: HTCondor pool when available, else local PANTHER.
+def _deploy_pestpp(template_ws, pst_name, master_dir, num_workers, worker_root,
+                   condor_kwargs=None, pestpp_exe="pestpp-ies"):
+    """Run any pestpp-* ensemble over workers: HTCondor pool when available, else local PANTHER.
 
+    Used for the expensive full-model ensembles (pestpp-ies: prior MC, DSIVC sweep, FOM history match)
+    AND the DSIVC outer optimization (pestpp-mou) -- pass the executable via ``pestpp_exe``.
     ``condor_kwargs`` forwards to condor_deploy (e.g. ``env_zip``, ``memory_mb``, ``cpus_per_worker``,
-    ``force_local``). ``env_zip`` defaults to the ``CONDOR_ENV_ZIP`` env var, or an auto-built
-    conda-pack tarball if unset. The pestpp master always runs locally; only the worker agents deploy.
+    ``n_workers``, ``force_local``). ``env_zip`` defaults to ``$CONDOR_ENV_ZIP`` or an auto-built
+    conda-pack tarball. The pestpp master always runs locally; only the worker agents deploy.
     """
     import os
     template_ws, master_dir, worker_root = Path(template_ws), Path(master_dir), Path(worker_root)
     if _htcondor_available():
         from condor_deploy import submit_condor_workers_from_env
         _configure_condor()
-        kw = {"n_workers": num_workers, "pestpp_exe": "pestpp-ies"}
-        kw.update(condor_kwargs or {})
+        kw = dict(CONDOR_DEFAULTS)                          # n_workers=60, memory/disk/cpus from measured usage
+        kw["pestpp_exe"] = pestpp_exe
+        kw.update(condor_kwargs or {})                     # per-run overrides win
         if not kw.get("env_zip"):                          # automatic --build-env if the zip is absent
             kw["env_zip"] = str(_ensure_env_zip())
-        print(f"  [deploy] HTCondor pool detected -> submitting {num_workers} worker agents "
-              f"(env_zip={kw['env_zip']})")
+        print(f"  [deploy] HTCondor pool detected -> submitting {kw['n_workers']} {pestpp_exe} worker "
+              f"agents (env_zip={kw['env_zip']})")
         submit_condor_workers_from_env(template_dir=str(template_ws), pst_name=pst_name,
                                        master_dir=str(master_dir), **kw)
     else:
@@ -1682,8 +1693,8 @@ def _deploy_fom_pestpp(template_ws, pst_name, master_dir, num_workers, worker_ro
         if worker_root.exists():
             shutil.rmtree(worker_root)
         worker_root.mkdir(parents=True)
-        print(f"  [deploy] no HTCondor pool -> {num_workers} local PANTHER workers")
-        pyemu.os_utils.start_workers(str(template_ws), "pestpp-ies", pst_name,
+        print(f"  [deploy] no HTCondor pool -> {num_workers} local {pestpp_exe} workers")
+        pyemu.os_utils.start_workers(str(template_ws), pestpp_exe, pst_name,
                                      num_workers=num_workers, master_dir=str(master_dir),
                                      worker_root=str(worker_root))
     return master_dir
@@ -1710,7 +1721,7 @@ def run_prior_mc(template_ws=WS3, num_workers=15, master_dir=WS5_MASTER, num_rea
     pst.pestpp_options["save_binary"] = True           # write obs/par ensembles as .jcb
     pst.control_data.noptmax = -1                       # evaluate prior ensemble only, no update
     pst.write(str(template_ws / "pest.pst"), version=2)
-    return _deploy_fom_pestpp(template_ws, "pest.pst", master_dir, num_workers, _S5_WORKER_ROOT,
+    return _deploy_pestpp(template_ws, "pest.pst", master_dir, num_workers, _S5_WORKER_ROOT,
                               condor_kwargs=condor_kwargs)
 
 
@@ -2653,6 +2664,119 @@ def run_dsi(dsi_template=WS6_DSI):
     pyemu.os_utils.run("pestpp-ies dsi.pst /e", cwd=str(Path(dsi_template)))
 
 
+# --- FULL-MODEL (FOM) history match -- the gold-standard comparison for the DSI posterior -----------
+WS_FOM = Path(__file__).parent / "_s6_fom_template"       # cloned from WS3 (keeps _s3_template clean)
+WS_FOM_MASTER = Path(__file__).parent / "_s6_fom_master"
+_S6_FOM_WORKER_ROOT = Path(__file__).parent / "_s6_fom_workers"
+
+
+def build_fom_conditioning(src_template=WS3, fom_template=WS_FOM, prior_master=WS5_MASTER,
+                           num_workers=60, seed=20260706, noptmax=1):
+    """Build a FULL-OUTPUT-MODEL (FOM) pestpp-ies history match -- the gold-standard the DSI-emulator
+    posterior is compared against. Mirrors ``build_dsi_conditioning`` EXACTLY on the real model
+    interface: targets = synthetic truth (already in obsval from stage 4), per-obs PROPORTIONAL weights
+    (1/obs_sigma -- not the fixed stage-4 weights), per-site:species phi factors, a correlated obs-noise
+    ensemble (same seed/convention), drop_conflicts, no autoadaloc/multimodal, noptmax -- with the ONE
+    exception ``ies_subset_size = num_workers`` (each lambda-test subset = one worker batch, since FOM
+    runs are expensive). REUSES the prior-MC parameter ensemble (``prior_master/pest.0.par.jcb`` -- the
+    exact ~120 realizations that produced the obs the DSI trained on), so the FOM conditions the SAME
+    prior as the DSI (clean apples-to-apples). Deploy with run_fom_conditioning.
+
+    Scale note: on the full obs set (~465k obs) the noise + per-iteration obs ensembles are large
+    (120 reals -> ~0.45 GB each); master-side only.
+    """
+    import subprocess
+    import pyemu
+    import herebedragons as hbd
+
+    src_template, fom_template = Path(src_template), Path(fom_template)
+    if fom_template.exists():
+        shutil.rmtree(fom_template)
+    subprocess.run(["cp", "-R", str(src_template), str(fom_template)], check=True)  # copytree drops files
+    hbd.get_bins(str(fom_template))
+
+    pst = pyemu.Pst(str(fom_template / "pest.pst"))
+    pst.try_parse_name_metadata()
+    obs = pst.observation_data
+
+    # (b) RECOMPUTE proportional weights (1/obs_sigma) + obgnme=obsid:species on the conditioning obs
+    #     (stage-4 injected truth->obsval + fixed weights; we overwrite the weights to match the DSI).
+    cond = list(obs.index[obs.weight.astype(float) > 0])
+    cm = obs.loc[cond]
+    species = np.where(cm["obgnme"].values == "head", "head",
+                       cm["variable"].astype(str).str.lower().values)
+    ovals = cm["obsval"].astype(float).values
+    sig = np.array([float(obs_sigma(np.array([v]), s)[0]) for v, s in zip(ovals, species)])
+    obs.loc[cond, "standard_deviation"] = sig
+    obs.loc[cond, "weight"] = 1.0 / sig
+    obs.loc[cond, "obgnme"] = [f"{oid}:{s}" for oid, s in zip(cm["obsid"].astype(str).values, species)]
+
+    # (c) ies_phi_factors: equal phi share per site:species group
+    groups = pd.unique(obs.loc[cond, "obgnme"])
+    pd.Series(1.0 / len(groups), index=groups).to_csv(fom_template / "ies_phi_factors.csv", header=False)
+    pst.pestpp_options["ies_phi_factor_file"] = "ies_phi_factors.csv"
+
+    # (d) REUSE the prior-MC parameter ensemble (the exact reals that produced the prior MC obs the DSI
+    #     trained on) -> the FOM conditions the SAME prior as the DSI. num_reals derived from it.
+    src_par = Path(prior_master) / "pest.0.par.jcb"
+    if not src_par.exists():
+        src_par = src_template / "prior_pe.jcb"            # fallback: the drawn prior ensemble
+    shutil.copy(src_par, fom_template / "fom_pe.jcb")
+    pe = pyemu.ParameterEnsemble.from_binary(pst=pst, filename=str(fom_template / "fom_pe.jcb"))
+    num_reals = pe.shape[0]
+
+    # (e) correlated observation-noise ensemble -- identical construction/seed to build_dsi_conditioning
+    noise = pyemu.ObservationEnsemble.from_gaussian_draw(pst, num_reals=num_reals)
+    rng = np.random.default_rng(seed)
+    for grp, g in obs.loc[cond].groupby("obgnme"):
+        z = rng.standard_normal(num_reals)[:, None]
+        vv = g["obsval"].astype(float).values[None, :] + z * g["standard_deviation"].astype(float).values[None, :]
+        if grp.split(":")[-1] not in ("ph", "tmp", "head"):
+            vv = np.clip(vv, 0.0, None)
+        noise._df.loc[:, g.index] = vv
+    noise.to_binary(str(fom_template / "noise.jcb"))
+
+    # (f) ies_* solver options -- SAME as the DSI conditioning except ies_subset_size = num_workers
+    fore = list(obs.index[obs.obgnme == "forecast"])
+    pst.pestpp_options["ies_par_en"] = "fom_pe.jcb"
+    pst.pestpp_options["ies_observation_ensemble"] = "noise.jcb"
+    pst.pestpp_options["forecasts"] = ",".join(fore)
+    pst.pestpp_options["ies_num_reals"] = num_reals
+    pst.pestpp_options["save_binary"] = True
+    pst.pestpp_options["ies_subset_size"] = num_workers    # THE exception (DSI used -100)
+    pst.pestpp_options["ies_drop_conflicts"] = True
+    pst.pestpp_options.pop("ies_autoadaloc", None)         # off, matching the DSI conditioning
+    pst.pestpp_options.pop("ies_multimodal_alpha", None)   # off
+    pst.pestpp_options["ies_no_noise"] = False             # use the provided correlated noise ensemble
+    pst.control_data.noptmax = noptmax
+    pst.write(str(fom_template / "pest.pst"), version=2)
+    print(f"  [build_fom_conditioning] {len(cond)} weighted obs, {len(groups)} phi groups, "
+          f"{len(fore)} forecast obs, {num_reals} reals, subset_size={num_workers}, noptmax={noptmax}")
+    return pst, fore
+
+
+def run_fom_conditioning(fom_template=WS_FOM, master_dir=WS_FOM_MASTER, num_workers=60,
+                         condor_kwargs=None):
+    """Deploy the FOM history match over workers (HTCondor when a pool is available, else local),
+    reusing the same routing as the prior MC / DSIVC sweep. Expensive: each ensemble evaluation runs
+    the full reactive model for every realization."""
+    return _deploy_pestpp(fom_template, "pest.pst", master_dir, num_workers, _S6_FOM_WORKER_ROOT,
+                              condor_kwargs=condor_kwargs)
+
+
+def stage6_fom(num_workers=None, condor_kwargs=None):
+    """Section-6 FOM history match orchestrator: build the full-model conditioning (mirrors the DSI IES;
+    reuses the prior-MC parameter ensemble; ies_subset_size = worker count) then deploy it. On a pool the
+    worker count defaults to CONDOR_DEFAULTS (60); locally to cpu_count-1. EXPENSIVE (one full reactive run
+    per realization per ensemble evaluation) -- intended for HTCondor."""
+    import os
+    if num_workers is None:
+        num_workers = CONDOR_DEFAULTS["n_workers"] if _htcondor_available() else max(1, (os.cpu_count() or 2) - 1)
+    build_fom_conditioning(num_workers=num_workers)     # subset_size = num_workers; ensemble from prior MC
+    run_fom_conditioning(num_workers=num_workers, condor_kwargs=condor_kwargs)
+    return WS_FOM_MASTER
+
+
 def dsi_posterior(dsi_template=WS6_DSI, forecast_cols=None, truth=None, noptmax=1):
     """Prior (iter 0) and posterior (last iter) recovered-SO4 forecast from the DSI obs ensembles."""
     import pyemu
@@ -2932,6 +3056,8 @@ WS7_SWEEP = Path(__file__).parent / "_s7_sweep_template"     # with_treatment PE
 WS7_SWEEP_MASTER = Path(__file__).parent / "_s7_sweep_master"
 _S7_WORKER_ROOT = Path(__file__).parent / "_s7_workers"
 WS7_DSIVC = Path(__file__).parent / "_s7_dsivc_template"      # runstore DSI + DSIVC (mou) template
+WS7_DSIVC_MASTER = Path(__file__).parent / "_s7_dsivc_master"
+_S7_DSIVC_WORKER_ROOT = Path(__file__).parent / "_s7_dsivc_workers"
 N_SWEEP = 120                                                 # match the Section-5 prior MC (paired)
 
 
@@ -2966,7 +3092,7 @@ def run_dsivc_sweep(template_ws=WS7_SWEEP, num_workers=15, master_dir=WS7_SWEEP_
                     num_reals=N_SWEEP, condor_kwargs=None):
     """Evaluate the f_treat sweep once (pestpp-ies noptmax=-1) over PANTHER workers -- the Section-5
     run_prior_mc pattern, but on the with_treatment interface + sweep_pe.jcb. Deploys via HTCondor
-    when a pool is available, else local (see _deploy_fom_pestpp)."""
+    when a pool is available, else local (see _deploy_pestpp)."""
     import pyemu
     template_ws, master_dir = Path(template_ws), Path(master_dir)
     pst = pyemu.Pst(str(template_ws / "pest.pst"))
@@ -2976,7 +3102,7 @@ def run_dsivc_sweep(template_ws=WS7_SWEEP, num_workers=15, master_dir=WS7_SWEEP_
     pst.pestpp_options["save_binary"] = True
     pst.control_data.noptmax = -1
     pst.write(str(template_ws / "pest.pst"), version=2)
-    return _deploy_fom_pestpp(template_ws, "pest.pst", master_dir, num_workers, _S7_WORKER_ROOT,
+    return _deploy_pestpp(template_ws, "pest.pst", master_dir, num_workers, _S7_WORKER_ROOT,
                               condor_kwargs=condor_kwargs)
 
 
@@ -3067,11 +3193,26 @@ def build_dsivc(merged=None, dsivc_template=WS7_DSIVC, truth_real="5", so4_perce
     #         cost                            (exact, from compute_cost.py)
     #         fore_peak_so4_stat:95%          (emulated risk band; NAME to confirm from prepare output)
     #     - pst_mou.pestpp_options['mou_objectives'] = 'cost,fore_peak_so4_stat:95%'
-    #     - pestpp-mou -> 1-D convex cost-vs-SO4 risk-banded front
+    #     - DEPLOY the outer pestpp-mou via run_dsivc_mou (HTCondor pool when available, else local) ->
+    #       1-D convex cost-vs-SO4 risk-banded front
     #
     # (h) FOM validation: run the optimum f_treat through the full model, check the peak lands in P5-P95.
     print("  [build_dsivc] SCAFFOLD -- steps (e)-(h) pending the landed prior MC + sweep; see docstring.")
     return dsi, train
+
+
+def run_dsivc_mou(dsivc_template=WS7_DSIVC, master_dir=WS7_DSIVC_MASTER, num_workers=None,
+                  condor_kwargs=None):
+    """Deploy the DSIVC OUTER optimization (pestpp-mou over the emulator) across workers -- HTCondor
+    when a pool is available, else local. Same routing as the FOM ensembles, but pestpp_exe='pestpp-mou'.
+    Each MOU candidate's forward run injects the decvars and runs a nested ``pestpp-ies dsi.pst /e``
+    conditioning (emulator-only, so a slot is light -- override CONDOR_DEFAULTS memory/disk via
+    condor_kwargs if you want to pack more per node)."""
+    import os
+    if num_workers is None:
+        num_workers = CONDOR_DEFAULTS["n_workers"] if _htcondor_available() else max(1, (os.cpu_count() or 2) - 1)
+    return _deploy_pestpp(dsivc_template, "dsivc.pst", master_dir, num_workers, _S7_DSIVC_WORKER_ROOT,
+                          condor_kwargs=condor_kwargs, pestpp_exe="pestpp-mou")
 
 
 def stage7_dsivc(num_workers=15, condor_kwargs=None):
@@ -3114,6 +3255,8 @@ if __name__ == "__main__":
         pr, po, tr = dsi_posterior(forecast_cols=_fore, truth=_truth)
         print(f"[stage6] prior P50={np.percentile(pr,50):.1f} -> posterior P50={np.percentile(po,50):.1f} "
               f"mg/L | truth {tr:.1f} | covered={np.percentile(po,5)<=tr<=np.percentile(po,95)}")
+    elif "--stage6fom" in sys.argv:                          # FULL-MODEL IES history match (DSI comparison)
+        stage6_fom()
     elif "--stage5" in sys.argv:
         stage5_prior_mc()
     elif "--stage3" in sys.argv:

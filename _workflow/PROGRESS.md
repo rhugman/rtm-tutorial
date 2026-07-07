@@ -342,6 +342,30 @@ as a zip, no shared FS). Wired so the expensive full-model ensembles auto-route:
   worker_env_packages cover the mf6rtm/PhreeqcRM stack (conda-pack solve). Needs conda/mamba+conda-pack
   on the submit node for the auto-build.
 
+## FOM-conditioning step (full-model IES; DSI gold-standard comparison) -- user 2026-07-07
+build_fom_conditioning (Section 6): clones WS3 -> _s6_fom_template (keeps _s3_template clean) and mirrors
+build_dsi_conditioning EXACTLY on the real model: targets=truth (obsval from stage 4), RECOMPUTED
+proportional weights 1/obs_sigma + obgnme=obsid:species (NOT the fixed stage-4 weights), per-site:species
+phi factors, the SAME correlated obs-noise ensemble (identical seed 20260706 + convention + num_reals ->
+identical shocks on the 1193 conditioning obs), drop_conflicts, autoadaloc OFF, multimodal OFF, noptmax=1
+-- EXCEPT ies_subset_size = num_workers (each lambda-test subset = one worker batch; DSI used -100). Fresh
+num_reals prior draw from prior_cov (+ hand-templated pyr-lograte) -> fom_pe.jcb. Verified setup (n=15):
+1193 weighted / 132 phi groups / 1152 forecast -- identical to the DSI conditioning.
+FOM ENSEMBLE = the prior-MC par ensemble (user 2026-07-07): build_fom_conditioning copies
+_s5_master/pest.0.par.jcb -> fom_pe.jcb (the exact 120 reals that produced the obs the DSI trained on;
+num_reals derived = 120). Clean apples-to-apples with the DSI. Verified: 120 reals, subset_size=12.
+run_fom_conditioning / stage6_fom (--stage6fom): deploy via _deploy_pestpp (HTCondor 60 workers, else
+local cpu_count-1). EXPENSIVE: 120 full reactive runs per ensemble eval -> this is why HTCondor was wired.
+Not yet run (needs a pool or a long local run). NEXT: run on a pool, then compare FOM vs DSI posterior.
+
+## MOU (DSIVC) deploy via Condor (user 2026-07-07)
+Generalized _deploy_fom_pestpp -> _deploy_pestpp(..., pestpp_exe): serves pestpp-ies (prior MC, sweep, FOM)
+AND pestpp-mou. run_dsivc_mou(dsivc_template=WS7_DSIVC, master=WS7_DSIVC_MASTER, ...) deploys the DSIVC
+outer optimization via the same HTCondor/local routing (pestpp_exe='pestpp-mou'). pestpp-mou added to
+worker_chmod_exes. build_dsivc scaffold step (g) now points at run_dsivc_mou. NB: MOU workers run the
+nested pestpp-ies /e (emulator-only, light) -> CONDOR_DEFAULTS memory/disk are over-provisioned; override
+via condor_kwargs to pack more per node. Callers of the deploy helper renamed (5 sites).
+
 ## SECTION 7 -- DSIVC optimization (DESIGN LOCKED 2026-07-06, not yet built)
 
 Framing: ADR-0003 f_treat lever (SUPERSEDES the old three-well dv-rate design in memory dsivc-part1-08).
