@@ -331,37 +331,40 @@ def loop_front(iter_dir, gen=None):
     return _nondominated(pop[pop["gen"] <= gen], "cost", P95), f"gen{gen}"
 
 
-def fig_loop_frame(iter_dir, gen=None, frame_idx=None, phase="front", ylim=None, xlim_cost=None):
+def fig_loop_frame(iter_dir, gen=None, frame_idx=None, phase="front", backdrop=None, new_pts=None,
+                   ylim=None, xlim_cost=None):
     """One movement-GIF frame. Two phases:
       * phase='front'   -- the DSIVC Pareto front at generation `gen` (cumulative non-dominated up to
-        `gen`; None = final archive) against the FOM cloud it was TRAINED on (accumulated FOM minus THIS
-        iteration's own infill);
+        `gen`; None = final archive) against the FOM cloud it was TRAINED on;
       * phase='samples' -- the same final front + the NEW FOM sample points this iteration added,
         highlighted as red stars (the state just before the next DSIVC retrain).
-    Pass ylim/xlim_cost to freeze axes across the animation."""
+    `backdrop`/`new_pts` (dfs with f_treat/cost/peak_so4) may be supplied by render_loop_frames (so an
+    in-progress iteration's front can be drawn against the previous iteration's cloud); if omitted they
+    are read from this iteration's own train_fom_cloud.csv. Pass ylim/xlim_cost to freeze axes."""
     apply_style()
     iter_dir = Path(iter_dir)
     it_num = int(iter_dir.name.replace("iter", ""))
     arc, gtag = loop_front(iter_dir, None if phase == "samples" else gen)
     _check_stack(arc, f"{iter_dir} {gtag}")
-    k = _infer_k_cost(arc)
-    cloud = load_loop_cloud(iter_dir, k)
-    is_new = cloud.index.astype(str).str.startswith(f"i{it_num}r")   # this iter's infill points
-    prior, new = cloud[~is_new], cloud[is_new]
+    if backdrop is None:                                  # self-contained fallback (complete iter only)
+        full = load_loop_cloud(iter_dir, _infer_k_cost(arc))
+        is_new = full.index.astype(str).str.startswith(f"i{it_num}r")
+        backdrop, new_pts = full[~is_new], full[is_new]
     tpk = _truth_peak(str(iter_dir / "master")) or _truth_peak(str(iter_dir.parent))
 
     fig, (a0, a1) = plt.subplots(1, 2, figsize=(13, 5.2))
     if phase == "samples":
-        _draw_overlay(fig, a0, a1, prior, arc, tpk, cloud_label=f"FOM cloud (n={len(prior)})",
-                      new_pts=new, ylim=ylim, xlim_cost=xlim_cost)
-        fig.suptitle(f"Outer loop — iter {it_num}: {len(new)} NEW FOM samples added at the Pareto picks "
-                     f"→ retrain (train n={len(cloud)})", fontweight="bold")
+        _draw_overlay(fig, a0, a1, backdrop, arc, tpk, cloud_label=f"FOM cloud (n={len(backdrop)})",
+                      new_pts=new_pts, ylim=ylim, xlim_cost=xlim_cost)
+        nn = 0 if new_pts is None else len(new_pts)
+        fig.suptitle(f"Outer loop — iter {it_num}: {nn} NEW FOM samples added at the Pareto picks "
+                     f"→ retrain (train n={len(backdrop) + nn})", fontweight="bold")
         name = f"frame_{frame_idx:03d}" if frame_idx is not None else f"loop_iter{it_num:02d}_samples"
     else:
-        _draw_overlay(fig, a0, a1, prior, arc, tpk, cloud_label=f"FOM cloud (n={len(prior)})",
+        _draw_overlay(fig, a0, a1, backdrop, arc, tpk, cloud_label=f"FOM cloud (n={len(backdrop)})",
                       ylim=ylim, xlim_cost=xlim_cost)
         fig.suptitle(f"Outer loop — iter {it_num}, {gtag}: DSIVC front vs FOM training cloud "
-                     f"(n={len(prior)})", fontweight="bold")
+                     f"(n={len(backdrop)})", fontweight="bold")
         name = f"frame_{frame_idx:03d}" if frame_idx is not None else f"loop_iter{it_num:02d}_{gtag}"
     return savefig(fig, name, f"{STAGE}/frames")
 
@@ -372,45 +375,69 @@ def render_loop_frames(loop_dir=None, per_gen=True, freeze_axes=True):
     not the axes. Returns the ordered list of frame paths; prints the ffmpeg/ImageMagick assembly line."""
     base = Path(__file__).parent
     loop_dir = Path(loop_dir or base / "_s7_loop")
-    # only COMPLETED iterations (train_fom_cloud.csv is written at the end of each) -- skip an in-progress one
+    # every iter with a front (has populations); an in-progress iter (no train_fom_cloud.csv yet) still
+    # gets its FRONT frames drawn against the cloud it was trained on (the previous iter's accumulation).
     iters = sorted(p for p in loop_dir.glob("iter*")
-                   if (p / "master").exists() and (p / "train_fom_cloud.csv").exists())
+                   if (p / "master").exists() and list((p / "master").glob("dsivc.*.obs_pop.csv")))
     if not iters:
-        raise FileNotFoundError(f"no completed iterNN/ under {loop_dir}")
-    # sweep all fronts once to fix common axes
+        raise FileNotFoundError(f"no iterNN/ with a front under {loop_dir}")
+    kc = next((_infer_k_cost(a) for a in (loop_front(it, None)[0] for it in iters)
+               if a is not None and not a.empty), None)                    # k_cost: cost=k*[-ln(1-f)]
+    complete = {it: (it / "train_fom_cloud.csv").exists() for it in iters}
+    if not complete[iters[0]]:
+        raise FileNotFoundError("iter00 not complete yet -- need its cloud to seed the backdrop")
+
+    def full_cloud(it):                       # accumulated FOM cloud AFTER a completed iteration
+        return load_loop_cloud(it, kc)
+
+    def backdrop_for(it):                      # the cloud iteration `it`'s emulator was TRAINED on
+        k = int(it.name.replace("iter", ""))
+        if k == 0:
+            c0 = full_cloud(iters[0])
+            return c0[~c0.index.astype(str).str.startswith("i0r")]         # base sweep (strip iter-0 infill)
+        prev = loop_dir / f"iter{k - 1:02d}"
+        return full_cloud(prev) if complete.get(prev) else None
+
+    # freeze axes over every backdrop + front we will draw
     ylim = xlim = None
     if freeze_axes:
         ymins, ymaxs, cmax = [], [], []
         for it in iters:
             a, _ = loop_front(it, None)
-            if a is None or a.empty:
+            bd = backdrop_for(it)
+            if a is None or a.empty or bd is None:
                 continue
-            ymins.append(min(a[PMIN].min(), load_loop_cloud(it, _infer_k_cost(a)).peak_so4.min()))
-            ymaxs.append(max(a[PMAX].max(), load_loop_cloud(it, _infer_k_cost(a)).peak_so4.max()))
-            cmax.append(a["cost"].max())
-        pad = 0.04 * (max(ymaxs) - min(ymins))
-        ylim = (min(ymins) - pad, max(ymaxs) + pad)
-        xlim = (-0.03 * max(cmax), 1.03 * max(cmax))
+            ymins.append(min(a[PMIN].min(), bd["peak_so4"].min()))
+            ymaxs.append(max(a[PMAX].max(), bd["peak_so4"].max()))
+            cmax.append(max(a["cost"].max(), bd["cost"].max()))
+        if ymins:
+            pad = 0.04 * (max(ymaxs) - min(ymins))
+            ylim = (min(ymins) - pad, max(ymaxs) + pad)
+            xlim = (-0.03 * max(cmax), 1.03 * max(cmax))
+
     frames, idx = [], 0
     for it in iters:
-        md = it / "master"
-        if per_gen:
-            gens = sorted(int(p.name.split(".")[1]) for p in md.glob("dsivc.*.obs_pop.csv")
-                          if "archive" not in p.name)
-        else:
-            gens = [None]
+        k = int(it.name.replace("iter", ""))
+        bd = backdrop_for(it)
+        if bd is None:
+            print(f"  [frames] skip {it.name}: previous iteration not complete (no training cloud)")
+            continue
+        gens = sorted(int(p.name.split(".")[1]) for p in (it / "master").glob("dsivc.*.obs_pop.csv")
+                      if "archive" not in p.name) if per_gen else [None]
         for g in gens:
             try:
-                frames.append(fig_loop_frame(it, gen=g, frame_idx=idx, phase="front",
+                frames.append(fig_loop_frame(it, gen=g, frame_idx=idx, phase="front", backdrop=bd,
                                              ylim=ylim, xlim_cost=xlim))
                 idx += 1
             except (FileNotFoundError, KeyError) as e:
                 print(f"  [frames] skip {it.name} gen={g}: {e}")
-        # after the front converges, a frame highlighting the NEW FOM samples (before the next retrain)
-        if (it / "train_fom_cloud.csv").exists():
+        # samples frame only once THIS iter is complete (its infill FOM wave has landed)
+        if complete[it]:
+            full = full_cloud(it)
+            new = full[full.index.astype(str).str.startswith(f"i{k}r")]
             try:
-                frames.append(fig_loop_frame(it, frame_idx=idx, phase="samples",
-                                             ylim=ylim, xlim_cost=xlim))
+                frames.append(fig_loop_frame(it, frame_idx=idx, phase="samples", backdrop=bd,
+                                             new_pts=new, ylim=ylim, xlim_cost=xlim))
                 idx += 1
             except (FileNotFoundError, KeyError) as e:
                 print(f"  [frames] skip {it.name} samples: {e}")
