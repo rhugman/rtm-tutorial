@@ -142,8 +142,9 @@ def load_sweep(sweep_master, sweep_template):
 
 
 def fig_sweep_tradeoff(sweep_master, sweep_template):
-    """Full-model (FOM) sweep: treatment COST vs f_treat (the deterministic convex cost curve) and peak
-    recovered-SO4 vs f_treat (the real, param-scattered leverage) -- the ground-truth reference."""
+    """Full-model (FOM) sweep -- the GROUND-TRUTH trade-off the DSIVC front must reproduce:
+    (a) cost vs peak recovered-SO4 cloud coloured by f_treat (the decision view); and
+    (b) peak recovered-SO4 vs f_treat (the real, param-scattered leverage)."""
     apply_style()
     s = load_sweep(sweep_master, sweep_template)
     tpk = _truth_peak(sweep_master)
@@ -151,16 +152,18 @@ def fig_sweep_tradeoff(sweep_master, sweep_template):
 
     fig, (a0, a1) = plt.subplots(1, 2, figsize=(13, 5.2))
 
-    # (a) cost vs f_treat -- deterministic; overlay the analytic c_unit*V_inj*[-ln(1-f)] (k inferred)
-    a0.scatter(s["f_treat"], s["cost"], s=30, color=ROLE["forecast"], edgecolor="none", alpha=0.75, zorder=4)
-    m = s["f_treat"] < 0.98
-    k = float(np.median(s.loc[m, "cost"] / np.maximum(-np.log(1.0 - s.loc[m, "f_treat"]), 1e-9)))
-    a0.plot(ff, k * -np.log(1.0 - ff), color=C["black"], lw=1.6,
-            label=r"$c_{unit}V_{inj}\,[-\ln(1-f_{treat})]$")
-    a0.set_xlabel(LBL["ftreat"])
-    a0.set_ylabel(LBL["cost"])
-    a0.legend(fontsize=9, loc="upper left")
-    a0.set_title(f"Treatment cost vs $f_{{treat}}$ ({len(s)} full-model runs)", fontsize=12)
+    # (a) the ground-truth trade-off cloud: cost (x, deterministic in f_treat) vs peak recovered-SO4
+    #     (y, param-scattered), coloured by the decision lever f_treat. Direct analog of the DSIVC front.
+    sc = a0.scatter(s["cost"], s["peak_so4"], c=s["f_treat"], cmap="viridis", s=34,
+                    edgecolor="none", alpha=0.8, zorder=4)
+    if tpk is not None:
+        a0.axhline(tpk, color=ROLE["truth"], ls="--", lw=1.4, label=f"truth ({tpk:.0f})")
+        a0.legend(fontsize=9, loc="upper right")
+    cb = fig.colorbar(sc, ax=a0)
+    cb.set_label("$f_{treat}$ (treatment fraction)")
+    a0.set_xlabel(LBL["cost"])
+    a0.set_ylabel("peak recovered SO$_4$ (mg/L)")
+    a0.set_title(f"Cost vs SO$_4$ trade-off ({len(s)} full-model runs)", fontsize=12)
 
     # (b) peak recovered-SO4 vs f_treat -- param-driven scatter + linear trend (the leverage)
     a1.scatter(s["f_treat"], s["peak_so4"], s=30, color=ROLE["prior"], edgecolor="none", alpha=0.75, zorder=4)
