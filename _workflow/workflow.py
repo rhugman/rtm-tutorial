@@ -1360,22 +1360,31 @@ def _add_array_prop(pf, ib, gs, tag, ws, bounds, base_fn, ult=None, second="cons
     return files
 
 
-def _inject_forward_run_log(fr_path):
-    """Redirect the generated forward_run.py's stdout+stderr (fd 1 & 2) to ``forward_run.log`` so the
-    ENTIRE forward run -- every pre-command print, the model output, and any uncaught traceback -- is
-    captured on the worker, even when it dies in a pre-command before mf6rtm/mfsim.lst exist. The block
-    is inserted right before the first ``def`` (after the imports, so ``os`` is available; before main()
-    runs). os.dup2 on the file descriptors catches subprocess output too. Idempotent."""
+def _inject_forward_run_header(fr_path):
+    """Inject a header into the generated forward_run.py (before the first ``def`` -- after the imports,
+    so os/pandas are available; before main() runs), doing two worker-hardening things:
+
+    (1) Redirect fd 1 & 2 to ``forward_run.log`` so the ENTIRE forward run (every pre-command print, the
+        model output, any uncaught traceback, subprocess output) is captured on the worker even when it
+        dies in a pre-command before mf6rtm/mfsim.lst exist -- shipped back by panther_transfer_on_fail.
+    (2) ``pandas.set_option('future.infer_string', False)`` BEFORE PstFrom's apply_list_and_array_pars
+        runs: on a worker env with pyarrow present, pandas-3 infers Arrow-backed string columns and
+        pyemu's ``.reshape()`` on them raises NotImplementedError. Forcing object strings (old behaviour)
+        makes it env-independent -- works whether or not the slot's env has pyarrow. Idempotent."""
     import re
     fr_path = Path(fr_path)
     txt = fr_path.read_text()
     if "forward_run.log" in txt:
         return
     block = (
-        "\n# --- capture the whole forward run for panther_transfer_on_fail (injected by build_pest_interface) ---\n"
+        "\n# --- worker hardening (injected by build_pest_interface) ---\n"
         "import os as _os\n"
         "_os.dup2(_os.open('forward_run.log', _os.O_WRONLY | _os.O_CREAT | _os.O_TRUNC, 0o644), 1)\n"
-        "_os.dup2(1, 2)\n\n"
+        "_os.dup2(1, 2)  # capture the whole forward run for panther_transfer_on_fail\n"
+        "try:\n"
+        "    import pandas as _pd; _pd.set_option('future.infer_string', False)  # no Arrow strings -> pyemu reshape ok\n"
+        "except Exception:\n"
+        "    pass\n\n"
     )
     m = re.search(r"^def ", txt, flags=re.M)
     if m:
@@ -1486,12 +1495,11 @@ def build_pest_interface(model_ws=WS, template_ws=WS3, num_reals=N_REALS, with_t
 
     pst = pf.build_pst(str(template_ws / "pest.pst"), version=2)
 
-    # --- capture the ENTIRE forward run to forward_run.log ----------------------------------
-    # The workers can die in a PRE-command (before mf6rtm/mfsim.lst even exist), so per-file capture
-    # isn't enough. Redirect the generated forward_run.py's fd 1+2 to forward_run.log at module load
-    # (right after its imports, before main()), so every pre-cmd print, the model output, and any
-    # uncaught traceback land in one file that panther_transfer_on_fail ships back on failure.
-    _inject_forward_run_log(template_ws / "forward_run.py")
+    # --- worker hardening: full-run log capture + pandas Arrow-string workaround ------------
+    # Workers can die in a PRE-command (before mf6rtm/mfsim.lst exist), so redirect the whole
+    # forward_run.py to forward_run.log for panther_transfer_on_fail; and force pandas object strings
+    # so PstFrom's apply_list_and_array_pars survives a slot env that has pyarrow (see the helper).
+    _inject_forward_run_header(template_ws / "forward_run.py")
 
     # --- pyrite reaction rate: single global hand-templated par -----------------------------
     _add_pyrite_rate_par(pst, template_ws)
