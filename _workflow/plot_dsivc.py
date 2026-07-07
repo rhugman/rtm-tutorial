@@ -124,7 +124,66 @@ def fig_dsivc_front(master_dir):
     return savefig(fig, "dsivc_front", STAGE)
 
 
+def load_sweep(sweep_master, sweep_template):
+    """Ground-truth full-model sweep: per-realization f_treat / cost / peak recovered-SO4 from the DSIVC
+    sweep obs ensemble (the data the DSI emulator trains on) -- the reference the emulated front must match."""
+    import pyemu
+    pst = pyemu.Pst(str(Path(sweep_template) / "pest.pst"))
+    pst.try_parse_name_metadata()
+    oe = pyemu.ObservationEnsemble.from_binary(
+        pst=pst, filename=str(Path(sweep_master) / "pest.0.obs.jcb"))
+    df = pd.DataFrame(oe.values, index=oe.index.astype(str), columns=[c.lower() for c in oe.columns])
+    o = pst.observation_data
+    ft = [c.lower() for c in o.index[o.obgnme == "ftreat"]][0]
+    ct = [c.lower() for c in o.index[o.obgnme == "cost"]][0]
+    fc = [c.lower() for c in o.index[o.obgnme == "forecast"]]
+    return pd.DataFrame({"f_treat": df[ft].values, "cost": df[ct].values,
+                         "peak_so4": df[fc].max(axis=1).values}).sort_values("f_treat").reset_index(drop=True)
+
+
+def fig_sweep_tradeoff(sweep_master, sweep_template):
+    """Full-model (FOM) sweep: treatment COST vs f_treat (the deterministic convex cost curve) and peak
+    recovered-SO4 vs f_treat (the real, param-scattered leverage) -- the ground-truth reference."""
+    apply_style()
+    s = load_sweep(sweep_master, sweep_template)
+    tpk = _truth_peak(sweep_master)
+    ff = np.linspace(0.0, float(s["f_treat"].max()), 200)
+
+    fig, (a0, a1) = plt.subplots(1, 2, figsize=(13, 5.2))
+
+    # (a) cost vs f_treat -- deterministic; overlay the analytic c_unit*V_inj*[-ln(1-f)] (k inferred)
+    a0.scatter(s["f_treat"], s["cost"], s=30, color=ROLE["forecast"], edgecolor="none", alpha=0.75, zorder=4)
+    m = s["f_treat"] < 0.98
+    k = float(np.median(s.loc[m, "cost"] / np.maximum(-np.log(1.0 - s.loc[m, "f_treat"]), 1e-9)))
+    a0.plot(ff, k * -np.log(1.0 - ff), color=C["black"], lw=1.6,
+            label=r"$c_{unit}V_{inj}\,[-\ln(1-f_{treat})]$")
+    a0.set_xlabel(LBL["ftreat"])
+    a0.set_ylabel(LBL["cost"])
+    a0.legend(fontsize=9, loc="upper left")
+    a0.set_title(f"Treatment cost vs $f_{{treat}}$ ({len(s)} full-model runs)", fontsize=12)
+
+    # (b) peak recovered-SO4 vs f_treat -- param-driven scatter + linear trend (the leverage)
+    a1.scatter(s["f_treat"], s["peak_so4"], s=30, color=ROLE["prior"], edgecolor="none", alpha=0.75, zorder=4)
+    z = np.polyfit(s["f_treat"], s["peak_so4"], 1)
+    r = s["f_treat"].corr(s["peak_so4"])
+    a1.plot(ff, np.polyval(z, ff), color=ROLE["emulated"], lw=2.2, label=f"trend (corr = {r:.2f})")
+    if tpk is not None:
+        a1.axhline(tpk, color=ROLE["truth"], ls="--", lw=1.4, label=f"truth ({tpk:.0f})")
+    a1.set_xlabel(LBL["ftreat"])
+    a1.set_ylabel("peak recovered SO$_4$ (mg/L)")
+    a1.legend(fontsize=8, loc="upper right")
+    a1.set_title("Peak recovered SO$_4$ vs $f_{treat}$ (full model)", fontsize=12)
+
+    fig.suptitle("Full-model sweep — treatment cost and recovered-SO$_4$ leverage vs $f_{treat}$",
+                 fontweight="bold")
+    return savefig(fig, "sweep_tradeoff", STAGE)
+
+
 if __name__ == "__main__":
+    if "--sweep" in sys.argv:
+        base = Path(__file__).parent
+        print(f"[plot_dsivc] wrote {fig_sweep_tradeoff(base / '_s7_sweep_master', base / '_s7_sweep_template')}")
+        sys.exit(0)
     md = sys.argv[1] if len(sys.argv) > 1 else str(Path(__file__).parent / "_s7_dsivc_master")
     if not (Path(md) / "dsivc.archive.obs_pop.csv").exists():
         md = str(Path(__file__).parent / "_s7_dsivc_template")   # serial test outputs land in the template
