@@ -1,0 +1,35 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "condor-deploy"
+version = "0.2.0"
+description = "HTCondor deployment helper for pestpp-ies panther runs"
+requires-python = ">=3.10"
+dependencies = []
+# condor_deploy has no hard third-party dependencies — it uses stdlib only.
+# The following are soft/optional dependencies expected in the calling environment:
+#   pyemu     — required by run_local() and the hello_world example
+#   numpy     — required by the hello_world example (hello_worker.py)
+#   pandas    — required by the hello_world example (hello_worker.py)
+
+[project.optional-dependencies]
+# Install with: pip install -e ".[build-env]"
+build-env = [
+    "conda-pack",   # required by build_worker_env_zip() / condor-deploy --build-env
+]
+# conda and mamba are system-level prerequisites for build_worker_env_zip()
+# and cannot be installed via pip — they must be present on the submit node.
+# Install via: conda install conda-pack  (or mamba install conda-pack)
+
+[project.scripts]
+condor-deploy = "condor_deploy.__main__:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/condor_deploy"]
+
+[tool.uv]
+dev-dependencies = [
+    "pytest>=8",
+]

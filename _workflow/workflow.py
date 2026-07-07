@@ -44,6 +44,7 @@ warnings.filterwarnings("ignore")
 # --- path wiring ---------------------------------------------------------------
 REPO = Path(__file__).resolve().parent.parent
 DATA_D = REPO / "data"
+DEPS = REPO / "dependencies"
 TUT = REPO / "tutorials"
 sys.path.insert(0, str(TUT))            # herebedragons
 sys.path.insert(0, str(Path(__file__).parent))  # wf_style
@@ -1604,7 +1605,92 @@ def draw_prior_ensemble(pf, num_reals, template_ws=WS3, seed=20260706):
     return pe
 
 
-def run_prior_mc(template_ws=WS3, num_workers=15, master_dir=WS5_MASTER, num_reals=None):
+# =============================================================================
+# FOM (full-model) pestpp deployment -- HTCondor when available, else local
+# =============================================================================
+# The expensive full-model pestpp ensembles (prior MC, DSIVC sweep) run their PANTHER worker agents
+# either on an HTCondor pool (via the vendored ``condor_deploy``: env travels as a conda-pack tarball,
+# the template as a zip -- no shared filesystem) or, when no pool is present, as LOCAL workers exactly
+# as before. Auto-routing on ``condor_submit`` availability keeps local behaviour unchanged off-cluster.
+
+
+def _htcondor_available():
+    """True iff an HTCondor pool is reachable (``condor_submit`` on PATH) AND condor_deploy imports."""
+    import shutil as _sh
+    if _sh.which("condor_submit") is None:
+        return False
+    try:
+        import condor_deploy  # noqa: F401
+    except ImportError:
+        return False
+    return True
+
+
+def _configure_condor():
+    """One-time condor_deploy project defaults: the four vendored deps travel as editable installs,
+    the model/pestpp binaries get +x on each slot, bulky run outputs are excluded from the worker zip,
+    and the pool is assumed LINUX. (Deployment also needs LINUX binaries in bin/linux -- open item.)"""
+    from condor_deploy import configure
+    configure(
+        worker_pip_editable=[str(DEPS / d) for d in ("flopy", "pyemu", "mf6rtm", "vorflow")],
+        worker_chmod_exes=["mf6", "pestpp-ies", "libmf6.so", "mf6rtm", "gridgen"],
+        zip_exclude=["*.ucn", "*.hds", "*.cbb", "*.cbc", "sout.csv", "*.lst", "*.list"],
+        platform_requirements='( (OpSys == "LINUX") )',
+        worker_python_version="3.12",
+    )
+
+
+def _ensure_env_zip():
+    """Resolve the worker-env conda-pack tarball, BUILDING it once if absent (automatic --build-env),
+    reusing it if present. Path = ``$CONDOR_ENV_ZIP`` or ``REPO/worker_env.tar.gz``. The build
+    (force_recreate=False) uses the packages + vendored editable deps set by _configure_condor, and
+    needs conda/mamba + conda-pack on the submit node."""
+    import os
+    from condor_deploy import build_worker_env_zip
+    env_zip = Path(os.environ.get("CONDOR_ENV_ZIP") or (REPO / "worker_env.tar.gz"))
+    if env_zip.exists():
+        print(f"  [deploy] reusing worker env zip: {env_zip}")
+    else:
+        print(f"  [deploy] worker env zip absent -> auto --build-env (once) -> {env_zip}")
+        build_worker_env_zip(str(env_zip), force_recreate=False)
+    return env_zip
+
+
+def _deploy_fom_pestpp(template_ws, pst_name, master_dir, num_workers, worker_root,
+                       condor_kwargs=None):
+    """Run a FOM pestpp ensemble over workers: HTCondor pool when available, else local PANTHER.
+
+    ``condor_kwargs`` forwards to condor_deploy (e.g. ``env_zip``, ``memory_mb``, ``cpus_per_worker``,
+    ``force_local``). ``env_zip`` defaults to the ``CONDOR_ENV_ZIP`` env var, or an auto-built
+    conda-pack tarball if unset. The pestpp master always runs locally; only the worker agents deploy.
+    """
+    import os
+    template_ws, master_dir, worker_root = Path(template_ws), Path(master_dir), Path(worker_root)
+    if _htcondor_available():
+        from condor_deploy import submit_condor_workers_from_env
+        _configure_condor()
+        kw = {"n_workers": num_workers, "pestpp_exe": "pestpp-ies"}
+        kw.update(condor_kwargs or {})
+        if not kw.get("env_zip"):                          # automatic --build-env if the zip is absent
+            kw["env_zip"] = str(_ensure_env_zip())
+        print(f"  [deploy] HTCondor pool detected -> submitting {num_workers} worker agents "
+              f"(env_zip={kw['env_zip']})")
+        submit_condor_workers_from_env(template_dir=str(template_ws), pst_name=pst_name,
+                                       master_dir=str(master_dir), **kw)
+    else:
+        import pyemu
+        if worker_root.exists():
+            shutil.rmtree(worker_root)
+        worker_root.mkdir(parents=True)
+        print(f"  [deploy] no HTCondor pool -> {num_workers} local PANTHER workers")
+        pyemu.os_utils.start_workers(str(template_ws), "pestpp-ies", pst_name,
+                                     num_workers=num_workers, master_dir=str(master_dir),
+                                     worker_root=str(worker_root))
+    return master_dir
+
+
+def run_prior_mc(template_ws=WS3, num_workers=15, master_dir=WS5_MASTER, num_reals=None,
+                 condor_kwargs=None):
     """Run the prior ensemble once (pestpp-ies noptmax=-1) over PANTHER workers.
 
     ``num_reals`` sizes the ensemble evaluated (default: use every realization in prior_pe.jcb).
@@ -1624,13 +1710,8 @@ def run_prior_mc(template_ws=WS3, num_workers=15, master_dir=WS5_MASTER, num_rea
     pst.pestpp_options["save_binary"] = True           # write obs/par ensembles as .jcb
     pst.control_data.noptmax = -1                       # evaluate prior ensemble only, no update
     pst.write(str(template_ws / "pest.pst"), version=2)
-    if _S5_WORKER_ROOT.exists():
-        shutil.rmtree(_S5_WORKER_ROOT)
-    _S5_WORKER_ROOT.mkdir(parents=True)
-    pyemu.os_utils.start_workers(str(template_ws), "pestpp-ies", "pest.pst",
-                                 num_workers=num_workers, master_dir=str(master_dir),
-                                 worker_root=str(_S5_WORKER_ROOT))
-    return master_dir
+    return _deploy_fom_pestpp(template_ws, "pest.pst", master_dir, num_workers, _S5_WORKER_ROOT,
+                              condor_kwargs=condor_kwargs)
 
 
 def prior_forecast(master_dir=WS5_MASTER, template_ws=WS3):
@@ -1974,7 +2055,7 @@ def _fig_prior_mc(peak, fore, times, truth_name=None):
     return savefig(fig, "prior_mc_forecast", "05_prior_mc")
 
 
-def stage5_prior_mc(num_reals=None, num_workers=None):
+def stage5_prior_mc(num_reals=None, num_workers=None, condor_kwargs=None):
     """Section-5 orchestrator: draw + run the prior MC, summarize the forecast distribution."""
     import os
     apply_style()
@@ -1983,7 +2064,7 @@ def stage5_prior_mc(num_reals=None, num_workers=None):
     print(f"[stage5_prior_mc] num_reals={nr} num_workers={nw}")
     pf, pst = build_pest_interface()                    # rebuild to obtain pf for the draw
     draw_prior_ensemble(pf, nr)
-    run_prior_mc(num_workers=nw, num_reals=nr)          # nr reals across nw workers (independent)
+    run_prior_mc(num_workers=nw, num_reals=nr, condor_kwargs=condor_kwargs)  # nr reals across nw workers
     peak, fore, times = prior_forecast()
     print(f"  [stage5] prior peak recovered-SO4: "
           f"P25={np.percentile(peak, 25):.1f} P50={np.percentile(peak, 50):.1f} "
@@ -2881,9 +2962,11 @@ def draw_sweep_ensemble(sweep_pst, prior_pe_path=WS3 / "prior_pe.jcb", template_
     return pe
 
 
-def run_dsivc_sweep(template_ws=WS7_SWEEP, num_workers=15, master_dir=WS7_SWEEP_MASTER, num_reals=N_SWEEP):
+def run_dsivc_sweep(template_ws=WS7_SWEEP, num_workers=15, master_dir=WS7_SWEEP_MASTER,
+                    num_reals=N_SWEEP, condor_kwargs=None):
     """Evaluate the f_treat sweep once (pestpp-ies noptmax=-1) over PANTHER workers -- the Section-5
-    run_prior_mc pattern, but on the with_treatment interface + sweep_pe.jcb."""
+    run_prior_mc pattern, but on the with_treatment interface + sweep_pe.jcb. Deploys via HTCondor
+    when a pool is available, else local (see _deploy_fom_pestpp)."""
     import pyemu
     template_ws, master_dir = Path(template_ws), Path(master_dir)
     pst = pyemu.Pst(str(template_ws / "pest.pst"))
@@ -2893,13 +2976,8 @@ def run_dsivc_sweep(template_ws=WS7_SWEEP, num_workers=15, master_dir=WS7_SWEEP_
     pst.pestpp_options["save_binary"] = True
     pst.control_data.noptmax = -1
     pst.write(str(template_ws / "pest.pst"), version=2)
-    if _S7_WORKER_ROOT.exists():
-        shutil.rmtree(_S7_WORKER_ROOT)
-    _S7_WORKER_ROOT.mkdir(parents=True)
-    pyemu.os_utils.start_workers(str(template_ws), "pestpp-ies", "pest.pst",
-                                 num_workers=num_workers, master_dir=str(master_dir),
-                                 worker_root=str(_S7_WORKER_ROOT))
-    return master_dir
+    return _deploy_fom_pestpp(template_ws, "pest.pst", master_dir, num_workers, _S7_WORKER_ROOT,
+                              condor_kwargs=condor_kwargs)
 
 
 def merge_training_data(prior_master=WS5_MASTER, prior_template=WS3,
@@ -2996,13 +3074,13 @@ def build_dsivc(merged=None, dsivc_template=WS7_DSIVC, truth_real="5", so4_perce
     return dsi, train
 
 
-def stage7_dsivc(num_workers=15):
+def stage7_dsivc(num_workers=15, condor_kwargs=None):
     """Section-7 orchestrator (draft): build sweep interface -> reuse-120 sweep ensemble -> run sweep ->
     merge with the prior MC -> build DSIVC. Requires the Section-5 prior MC (_s5_master) already landed."""
     apply_style()
     _pf, sweep_pst = build_sweep_interface()
     draw_sweep_ensemble(sweep_pst)
-    run_dsivc_sweep(num_workers=num_workers)
+    run_dsivc_sweep(num_workers=num_workers, condor_kwargs=condor_kwargs)
     merged, _fore = merge_training_data()
     return build_dsivc(merged)
 

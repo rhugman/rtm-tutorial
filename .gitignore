@@ -71,3 +71,12 @@ _workflow/_s6_fig_*/
 _workflow/_s*/
 _workflow/_treat_scratch/
 _workflow/_s5_master_snap*/
+
+# talk deck: generated outputs (DECK_PLAN.md + build script stay tracked)
+_talk/talk_deck.pptx
+_talk/_deck_preview/
+_talk/__pycache__/
+
+# condor_deploy: auto-built worker conda-pack env (large)
+worker_env.tar.gz
+_condor_staging_*/

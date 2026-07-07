@@ -324,6 +324,24 @@ unless requested. Full 36-real IES LOO now ~8min (was ~1.75hr). regen relaunched
   (ftreat.csv written) + into mf6rtm. ~60-80min. First attempt (bx3qayr8o) failed 120/120 fast on the
   embedding bug -> fixed. NEXT after it lands: merge_training_data (240-real) + build_dsivc.
 
+## HTCondor deployment for FOM pestpp runs (user 2026-07-07)
+Vendored dep dependencies/condor_deploy (HTCondor helper; env travels as conda-pack tarball + template
+as a zip, no shared FS). Wired so the expensive full-model ensembles auto-route:
+- _htcondor_available(): condor_submit on PATH AND condor_deploy importable.
+- _deploy_fom_pestpp(template, pst, master, n_workers, worker_root, condor_kwargs): if a pool ->
+  condor_deploy.submit_condor_workers_from_env(...); else LOCAL pyemu start_workers (behaviour UNCHANGED
+  off-cluster). _configure_condor(): worker_pip_editable=the 4 vendored deps, worker_chmod_exes=binaries,
+  zip_exclude=bulky outputs, platform LINUX. env_zip from CONDOR_ENV_ZIP or auto-built.
+- run_prior_mc + run_dsivc_sweep (and stage5_prior_mc/stage7_dsivc) now take condor_kwargs and route
+  through _deploy_fom_pestpp. Verified HERE: condor_submit absent -> LOCAL path (unchanged); condor_deploy
+  importable. condor_deploy added to environment.yml (editable). Did NOT install HTCondor (user directive).
+- _ensure_env_zip(): the worker-env conda-pack tarball auto-builds (--build-env) ONCE if absent and is
+  reused if present (force_recreate=False; packages/editable deps from _configure_condor). Path =
+  $CONDOR_ENV_ZIP or REPO/worker_env.tar.gz (gitignored). Explicit condor_kwargs['env_zip'] still wins.
+- OPEN for real deployment: LINUX pestpp/mf6 binaries in bin/linux (not yet populated); confirm
+  worker_env_packages cover the mf6rtm/PhreeqcRM stack (conda-pack solve). Needs conda/mamba+conda-pack
+  on the submit node for the auto-build.
+
 ## SECTION 7 -- DSIVC optimization (DESIGN LOCKED 2026-07-06, not yet built)
 
 Framing: ADR-0003 f_treat lever (SUPERSEDES the old three-well dv-rate design in memory dsivc-part1-08).
