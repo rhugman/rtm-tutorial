@@ -129,6 +129,9 @@ FORECAST_SP = range(21, NPER)  # SP21..end -> recovery/forecast (now spans the e
 INJ_TOTAL = 360.0                  # total base injection / recovery rate (m3/d)
 LAYERS_IN = [1, 2, 3, 5, 7]        # wellin screens (5 layers)
 LAYERS_OUT = [1, 3, 5]             # wellout screens (3 layers)
+# per-screen ON/OFF decision variables: one par per wellin/wellout screen, U[0,1], ACTIVE iff >= 0.5.
+# apply_well_rates distributes each well's total rate (T-weighted) among ONLY its active screens.
+SCREEN_DVS = [f"swin_l{L}" for L in LAYERS_IN] + [f"swout_l{L}" for L in LAYERS_OUT]
 
 # Regional flow: impose a left->right head gradient across the CHD boundaries (was flat h=0).
 CHD_GRADIENT = 0.001               # m/m, head decreasing left->right (flow left->right)
@@ -850,6 +853,22 @@ def _add_treatment_par(pst, template_ws):
         [0.0, 0.0, F_TREAT_BOUNDS[1], "decvar", "none"]
 
 
+def _add_screen_pars(pst, template_ws):
+    """Hand-template the per-screen ON/OFF decision variables (one per wellin/wellout screen) over
+    ``screens.dat``. Each varies in [0, 1]; ``apply_well_rates`` treats a screen as ACTIVE iff its value
+    >= 0.5 and T-weights the well's total rate among only the active screens. parval1=1.0 (baseline = all
+    screens on, matching the pre-decvar behaviour), partrans='none' (a toggle, not a log quantity),
+    pargp='decvar' so the sweep/merge/DSIVC steps select them by metadata alongside f_treat."""
+    lines = ["ptf ~"] + [f"{n}  ~  {n}  ~" for n in SCREEN_DVS]
+    tpl = Path(template_ws, "screens.dat.tpl")
+    tpl.write_text("\n".join(lines) + "\n")
+    pst.add_parameters(str(tpl), pst_path=".")
+    par = pst.parameter_data
+    for n in SCREEN_DVS:
+        par.loc[n, ["parval1", "parlbnd", "parubnd", "pargp", "partrans"]] = [1.0, 0.0, 1.0, "decvar", "none"]
+    return SCREEN_DVS
+
+
 def omp_env_guard(ws="."):
     """FORWARD-RUN pre-command (self-contained, runs FIRST): set KMP_DUPLICATE_LIB_OK so the ``mf6rtm``
     subprocess spawned later in the forward run survives the duplicate-libomp clash (OMP Error #15 --
@@ -862,12 +881,19 @@ def omp_env_guard(ws="."):
 
 def apply_well_rates(ws="."):
     """FORWARD-RUN pre-command: set transmissivity-weighted wellin/wellout rates from the
-    (PstFrom-perturbed) K field.
+    (PstFrom-perturbed) K field, distributed among only the ACTIVE screens.
 
     A screened well splits its total rate between screens by T = K x layer thickness. K is a
     PstFrom pilot-point parameter, so the split must be recomputed on EVERY forward run from the
     perturbed K (written to the npf arrays by ``apply_list_and_array_pars``, which runs first).
     Totals are conserved (wellin +360, wellout -360 m3/d); only the per-screen split moves.
+
+    Per-screen ON/OFF decision variables (``screens.dat``, one value per screen in [0,1]): a screen is
+    ACTIVE iff its value >= 0.5, and the well's total rate is T-weighted among ONLY the active screens
+    (inactive screens get q = 0). If every screen of a well is toggled off, the single highest-valued
+    screen is kept active so the doublet stays mass-balanced. Absent screens.dat (the base interface),
+    all screens are active -- the original behaviour. The realised toggles are echoed to
+    ``screens_echo.csv`` (the controllable-obs decvars).
 
     Self-contained (all imports + geometry constants inline) so PstFrom can inject it verbatim.
     Touches ONLY the wellin/wellout WEL ``q`` columns via per-package writes -- never
@@ -883,6 +909,15 @@ def apply_well_rates(ws="."):
     INJ_TOTAL = 360.0
 
     ws = Path(ws)
+    # per-screen toggles from screens.dat ("name value" per line); absent -> all screens active (1.0)
+    toggles = {}
+    sdat = ws / "screens.dat"
+    if sdat.exists():
+        for line in sdat.read_text().splitlines():
+            p = line.split()
+            if len(p) >= 2:
+                toggles[p[0]] = float(p[1])
+
     sim = flopy.mf6.MFSimulation.load(sim_ws=str(ws), verbosity_level=0)
     gwf = sim.get_model("gwf")
     k = np.asarray(gwf.get_package("npf").k.array)      # perturbed K (nlay, ncpl)
@@ -897,20 +932,32 @@ def apply_well_rates(ws="."):
         T = np.array(T, dtype=float)
         return T / T.sum()
 
-    for pkg, layers, total in [("welin", LAYERS_IN, INJ_TOTAL),
-                               ("welout", LAYERS_OUT, -INJ_TOTAL)]:
+    for pkg, layers, total, pref in [("welin", LAYERS_IN, INJ_TOTAL, "swin"),
+                                     ("welout", LAYERS_OUT, -INJ_TOTAL, "swout")]:
         wel = gwf.get_package(pkg)
         spd = wel.stress_period_data.get_data()
         cell = int(next(iter(spd.values()))["cellid"][0][1])   # single well cell2d
-        w = _tw(cell, layers)
-        rate = {L: total * float(w[e]) for e, L in enumerate(layers)}
+        active = [L for L in layers if toggles.get(f"{pref}_l{L}", 1.0) >= 0.5]
+        if not active:                                          # all off -> keep the highest-valued screen
+            active = [max(layers, key=lambda L: toggles.get(f"{pref}_l{L}", 1.0))]
+        w = _tw(cell, active)                                   # T-weights among ACTIVE screens only
+        rate = {L: 0.0 for L in layers}                        # inactive screens -> no flow
+        for e, L in enumerate(active):
+            rate[L] = total * float(w[e])
         for kper, rec in spd.items():
             for i in range(len(rec)):
                 rec["q"][i] = rate[int(rec["cellid"][i][0])]
             wel.stress_period_data.set_data({kper: rec})
         wel.set_all_data_external()
         wel.write()
-    print("  [apply_well_rates] transmissivity-weighted wellin/wellout rates written")
+
+    if sdat.exists():                                          # echo the realised toggles as decvar obs
+        names = [f"swin_l{L}" for L in LAYERS_IN] + [f"swout_l{L}" for L in LAYERS_OUT]
+        with open(ws / "screens_echo.csv", "w") as fh:
+            fh.write("item,value\n")
+            for n in names:
+                fh.write(f"{n},{toggles.get(n, 1.0):.10E}\n")
+    print("  [apply_well_rates] active-screen T-weighted wellin/wellout rates written")
 
 
 def process_spatial_snapshots(ws="."):
@@ -1482,6 +1529,13 @@ def build_pest_interface(model_ws=WS, template_ws=WS3, num_reals=N_REALS, with_t
                             prefix="ftreat", obsgp="ftreat")     # the controllable-obs decvar
         pf.add_observations("cost_obs.csv", index_cols=["item"], use_cols="value",
                             prefix="cost", obsgp="cost")         # exact cost (carried; excluded from DSI train)
+        # per-screen on/off decvars: baseline all-on screens.dat + echoed obs (the controllable decvars).
+        # apply_well_rates rewrites screens_echo.csv each run; here we seed it so add_observations can read it.
+        (template_ws / "screens.dat").write_text("\n".join(f"{n} 1.0" for n in SCREEN_DVS) + "\n")
+        pd.DataFrame({"item": SCREEN_DVS, "value": [1.0] * len(SCREEN_DVS)}).to_csv(
+            template_ws / "screens_echo.csv", index=False)
+        pf.add_observations("screens_echo.csv", index_cols=["item"], use_cols="value",
+                            prefix="screen", obsgp="screen")     # controllable-obs screen decvars
 
     # --- parameters: uncertain aquifer properties -------------------------------------------
     _add_array_prop(pf, ib, gs, "npf_k_", template_ws, (0.001, 10.0),
@@ -1506,9 +1560,10 @@ def build_pest_interface(model_ws=WS, template_ws=WS3, num_reals=N_REALS, with_t
     # --- pyrite reaction rate: single global hand-templated par -----------------------------
     _add_pyrite_rate_par(pst, template_ws)
 
-    # --- f_treat decision variable (DSIVC sweep interface only) ------------------------------
+    # --- decision variables (DSIVC sweep interface only): f_treat + per-screen on/off ---------
     if with_treatment:
         _add_treatment_par(pst, template_ws)
+        _add_screen_pars(pst, template_ws)
 
     # --- forecast group + pestpp options ----------------------------------------------------
     pst.try_parse_name_metadata()
@@ -3177,7 +3232,9 @@ def draw_sweep_ensemble(sweep_pst, prior_pe_path=WS3 / "prior_pe.jcb", template_
     df = pe_prior._df.copy()
     rng = np.random.default_rng(seed)
     df["f_treat"] = rng.uniform(F_TREAT_BOUNDS[0], F_TREAT_BOUNDS[1], size=df.shape[0])
-    df = df.loc[:, list(sweep_pst.par_names)]                 # align to the sweep pst par order (+f_treat)
+    for n in SCREEN_DVS:                                      # per-screen on/off toggles ~ U[0,1]
+        df[n] = rng.uniform(0.0, 1.0, size=df.shape[0])
+    df = df.loc[:, list(sweep_pst.par_names)]                 # align to the sweep pst par order (+decvars)
     pe = pyemu.ParameterEnsemble(pst=sweep_pst, df=df)
     pe.enforce()
     out = Path(template_ws) / "sweep_pe.jcb"
@@ -3233,10 +3290,25 @@ def merge_training_data(prior_master=WS5_MASTER, prior_template=WS3,
     ft_obs = [o for o in pst_s.observation_data.index if pst_s.observation_data.loc[o, "obgnme"] == "ftreat"]
     assert len(ft_obs) == 1, f"expected one ftreat obs, got {ft_obs}"
     ftreat = ft_obs[0].lower()
+    # per-screen decvars: the sweep echo obs (obgnme='screen') -> their decvar names (swin_l1, ...)
+    screen_map = {}
+    for o in pst_s.observation_data.index:
+        if pst_s.observation_data.loc[o, "obgnme"] == "screen":
+            ol = o.lower()
+            hit = next((D for D in SCREEN_DVS if f"item:{D}".lower() in ol or ol.endswith(D.lower())), None)
+            if hit:
+                screen_map[ol] = hit
+    scr_obs = list(screen_map.keys())
 
     dp = dp.loc[:, keep].astype(float)
     dp["f_treat"] = 0.0                                      # prior-MC half: baseline (echoed obs = 0)
-    ds = ds.loc[:, keep + [ftreat]].astype(float).rename(columns={ftreat: "f_treat"})
+    if scr_obs:                                             # sweep interface carries the per-screen decvars
+        for D in SCREEN_DVS:
+            dp[D] = 1.0                                      # prior MC ran with every screen on
+        ds = ds.loc[:, keep + [ftreat] + scr_obs].astype(float).rename(
+            columns={ftreat: "f_treat", **screen_map})
+    else:                                                  # legacy sweep (no screen decvars)
+        ds = ds.loc[:, keep + [ftreat]].astype(float).rename(columns={ftreat: "f_treat"})
 
     dp.index = [f"p{i}" for i in range(dp.shape[0])]
     ds.index = [f"s{i}" for i in range(ds.shape[0])]
@@ -3350,13 +3422,16 @@ def build_dsivc(merged=None, dsivc_template=WS7_DSIVC, runstore=WS7_DSIVC_RUNSTO
         noise._df.loc[:, g.index] = vv
     noise.to_binary(str(runstore / "dsi.obs+noise.jcb"))
 
-    # (d) DSIVC over the conditioning-ready runstore DSI, f_treat as the controllable decvar
+    # (d) DSIVC over the conditioning-ready runstore DSI: f_treat + the per-screen on/off toggles are the
+    #     controllable decvars (each a zero-weight DSI obs column; DSIVC weights them). Screen decvars only
+    #     enter when the training set carries them (the sweep interface echoes them; guard for older sets).
+    decvar_names = ["f_treat"] + [d for d in SCREEN_DVS if d in merged.columns]
     oe = pyemu.ObservationEnsemble(pst=dpst, df=merged.loc[:, dpst.obs_names])
     dv = DSIVC(emulator=dsi, dsi_t_d=str(runstore), oe=oe)
-    pst = dv.prepare_pestpp(str(dsivc_template), decvar_names=["f_treat"],
+    pst = dv.prepare_pestpp(str(dsivc_template), decvar_names=decvar_names,
                             percentiles=(round(1.0 - so4_pct, 4), so4_pct),
                             inner_noptmax=inner_noptmax, mou_population_size=mou_pop,
-                            decvar_weight=1000.0,            # std ~0.001 on f_treat -> pin it hard, else the
+                            decvar_weight=1000.0,            # std ~0.001 on each decvar -> pin it hard, else the
                                                             # inner conditioning barely constrains it and the
                                                             # posterior SO4 stays at the prior mean (degenerate)
                             ies_exe_path="./pestpp-ies")     # local 5.2.24 (PATH pestpp-ies 5.2.16 rejects /e)
@@ -3544,16 +3619,16 @@ def seed_dvpop_from_archive(prev_master, dsivc_template, seed=0):
     dv = pst.adj_par_names
     mou_pop = int(pst.pestpp_options.get("mou_population_size", 2 * len(dv)))
     arc = pd.read_csv(Path(prev_master) / "dsivc.archive.dv_pop.csv").set_index("real_name")
-    vals = np.sort(arc[dv].astype(float).values, axis=0) if len(dv) > 1 else \
-        np.sort(arc[dv[0]].astype(float).values)[:, None]
-    if vals.shape[0] >= mou_pop:                        # even spread across the (sorted) front
-        idx = np.linspace(0, vals.shape[0] - 1, mou_pop).round().astype(int)
+    vals = arc[dv].astype(float).values                 # (n_arc, n_dv) -- ROWS are Pareto combos; keep intact
+    n = vals.shape[0]
+    if n >= mou_pop:                                    # even spread of WHOLE members (preserve decvar combos)
+        idx = np.linspace(0, n - 1, mou_pop).round().astype(int)
         seed_vals = vals[idx]
     else:                                               # use all + pad with uniform draws to mou_pop
         rng = np.random.default_rng(seed)
         lo = pst.parameter_data.loc[dv, "parlbnd"].astype(float).values
         hi = pst.parameter_data.loc[dv, "parubnd"].astype(float).values
-        pad = rng.uniform(lo, hi, size=(mou_pop - vals.shape[0], len(dv)))
+        pad = rng.uniform(lo, hi, size=(mou_pop - n, len(dv)))
         seed_vals = np.vstack([vals, pad])
     df = pd.DataFrame(seed_vals, columns=dv, index=[f"seed_{i}" for i in range(mou_pop)])
     for p in pst.par_names:                             # carry any non-decvar pars at their control value
