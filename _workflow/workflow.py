@@ -3327,41 +3327,52 @@ def stage7_dsivc(num_workers=None, condor_kwargs=None):
     return build_dsivc(merged)
 
 
-def run_all(num_reals=N_PRIOR_MC, num_workers=None, condor_kwargs=None, quantile=0.75):
+def run_all(num_reals=N_PRIOR_MC, num_workers=None, condor_kwargs=None, quantile=0.75, force=False):
     """ONE-SHOT DRIVER (``--all``): run the whole DIZON arc, stages 2 -> 7, in order, NO STOPS. Each
     stage writes the workspace the next consumes (mothership pattern). The heavy stages (prior MC,
     full-model IES history match, DSIVC sweep) auto-deploy to HTCondor when a pool is reachable, else
-    to local PANTHER workers -- so this same command scales from a laptop to a cluster. End-to-end
-    locally is many hours of full-model runs; on a pool it is the intended way to deploy the workflow.
+    to local PANTHER workers -- so this same command scales from a laptop to a cluster.
 
-    Stage 4 (lock truth + weights) is sequenced correctly here -- AFTER the prior MC (it needs the
-    prior forecast to pick the P-quantile truth) and BEFORE stage 6.
+    RESUME (default): each stage is SKIPPED if its completion artifact already exists, so a re-run
+    continues from where it stopped rather than redoing hours of full-model runs. ``force=True``
+    (CLI: ``--all --force``) redoes every stage. CAVEAT: re-running one upstream stage does NOT
+    auto-invalidate downstream artifacts -- use --force, or delete the stale outputs, to be safe.
+
+    Stage 4 (lock truth + weights) is sequenced AFTER the prior MC (it needs the prior forecast to
+    pick the P-quantile truth) and BEFORE stage 6.
     """
-    def _hdr(s):
-        print(f"\n{'=' * 72}\n[run_all] {s}\n{'=' * 72}", flush=True)
+    figs = Path(__file__).parent / "_figs"
 
-    _hdr("stage 2 -- model build + baseline run")
-    stage2_build(run_model=True)
-    _hdr("stage 3 -- PstFrom PEST interface")
-    stage3_pstfrom()
-    _hdr(f"stage 5 -- prior Monte Carlo ({num_reals} reals)")
-    stage5_prior_mc(num_reals=num_reals, num_workers=num_workers, condor_kwargs=condor_kwargs)
-    _hdr("stage 4 -- lock synthetic truth + inject weights")
-    stage4_truth_weights(quantile=quantile)
-    _hdr("stage 6 -- DSI condition + cross-validation + signature figures")
-    regen_figs()
-    _hdr("stage 6-FOM -- full-model IES history match (DSI gold-standard)")
-    stage6_fom(num_workers=num_workers, condor_kwargs=condor_kwargs)
-    _hdr("stage 7 -- DSIVC f_treat sweep + merge (240-real) + optimizer")
-    stage7_dsivc(num_workers=num_workers, condor_kwargs=condor_kwargs)
-    _hdr("DONE -- full DIZON arc complete")
+    def _step(title, marker, fn):
+        print(f"\n{'=' * 72}\n[run_all] {title}\n{'=' * 72}", flush=True)
+        if not force and Path(marker).exists():
+            print(f"  cached: {Path(marker).name} exists -> skip (use --all --force, or delete it, to redo)",
+                  flush=True)
+            return
+        fn()
+
+    _step("stage 2 -- model build + baseline run", WS / "sout.csv",
+          lambda: stage2_build(run_model=True))
+    _step("stage 3 -- PstFrom PEST interface", WS3 / "pest.pst",
+          lambda: stage3_pstfrom())
+    _step(f"stage 5 -- prior Monte Carlo ({num_reals} reals)", WS5_MASTER / "pest.0.obs.jcb",
+          lambda: stage5_prior_mc(num_reals=num_reals, num_workers=num_workers, condor_kwargs=condor_kwargs))
+    _step("stage 4 -- lock synthetic truth + inject weights", Path(__file__).parent / "_truth" / "truth_meta.txt",
+          lambda: stage4_truth_weights(quantile=quantile))
+    _step("stage 6 -- DSI condition + cross-validation + figures", figs / "06_dsi" / "dsi_forecast.png",
+          lambda: regen_figs())
+    _step("stage 6-FOM -- full-model IES history match", WS_FOM_MASTER / "pest.0.obs.jcb",
+          lambda: stage6_fom(num_workers=num_workers, condor_kwargs=condor_kwargs))
+    _step("stage 7 -- DSIVC f_treat sweep + merge + optimizer", WS7_SWEEP_MASTER / "pest.0.obs.jcb",
+          lambda: stage7_dsivc(num_workers=num_workers, condor_kwargs=condor_kwargs))
+    print(f"\n{'=' * 72}\n[run_all] DONE -- full DIZON arc complete\n{'=' * 72}", flush=True)
 
 
 if __name__ == "__main__":
     _run = "--run" in sys.argv
     _rebuild = "--rebuild" in sys.argv
     if "--all" in sys.argv:                                  # one-shot: whole arc, stages 2->7, no stops
-        run_all()
+        run_all(force="--force" in sys.argv)                 # resume by default; --force redoes every stage
     elif "--stage7sweep" in sys.argv:                        # build + run the f_treat sweep only
         _pf, _spst = build_sweep_interface()
         draw_sweep_ensemble(_spst)

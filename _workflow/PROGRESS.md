@@ -394,6 +394,16 @@ Each CLI stage flag calls exactly what run_all does. Fixes:
 Verified: N_PRIOR_MC=N_SWEEP=120, stage5 ->120 reals, --stage6->regen_figs, --stage2 runs model, run_all
 num_reals=120. Bump the production count in ONE place (N_PRIOR_MC) if scaling up.
 
+## --all RESUME (user 2026-07-07)
+run_all now skips a stage if its completion artifact exists (a re-run continues instead of redoing hours
+of full-model runs). --all --force redoes everything. Markers: stage2=_s2_model/sout.csv, stage3=
+_s3_template/pest.pst, stage5=_s5_master/pest.0.obs.jcb, stage4=_truth/truth_meta.txt, stage6=
+_figs/06_dsi/dsi_forecast.png, stage6fom=_s6_fom_master/pest.0.obs.jcb, stage7=_s7_sweep_master/pest.0.obs.jcb.
+CAVEATS: (1) re-running an upstream stage does NOT auto-invalidate downstream markers -- use --force or
+delete stale outputs. (2) stage7 marker is the SWEEP obs.jcb, so once the sweep is done --all skips the whole
+stage7 (merge + build_dsivc too) -- run --stage7merge / --stage7 to build the DSIVC after a completed sweep
+(revisit once build_dsivc has a real MOU output artifact to key on).
+
 ## SECTION 7 -- DSIVC optimization (DESIGN LOCKED 2026-07-06, not yet built)
 
 Framing: ADR-0003 f_treat lever (SUPERSEDES the old three-well dv-rate design in memory dsivc-part1-08).
