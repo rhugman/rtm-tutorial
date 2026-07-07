@@ -394,8 +394,10 @@ def render_loop_frames(loop_dir=None, per_gen=True, freeze_axes=True):
             bd = backdrop_for(it)
             if a is None or a.empty or bd is None:
                 continue
-            ymins.append(min(a[PMIN].min(), bd["peak_so4"].min()))
-            ymaxs.append(max(a[PMAX].max(), bd["peak_so4"].max()))
+            # range from the PHYSICAL cloud + front P95/mean, NOT the DSI stack min/max (extreme Gaussian
+            # tails would blow the y-axis out and leave frames mostly empty).
+            ymins.append(min(bd["peak_so4"].min(), a[P95].min(), a[PMEAN].min()))
+            ymaxs.append(max(bd["peak_so4"].max(), a[P95].max(), a[PMEAN].max()))
             cmax.append(max(a["cost"].max(), bd["cost"].max()))
         if ymins:
             pad = 0.04 * (max(ymaxs) - min(ymins))

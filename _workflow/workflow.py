@@ -3537,29 +3537,43 @@ def infill_ftreat(archive_ft, train_ft=None, n_f=8, prev_res=None, alpha=0.6, be
     return np.interp(q, cdf, grid)
 
 
-def infill_points(archive, decvars, n_f, obj_col="cost", prev_res=None, beta=3.0):
-    """Multi-decvar infill: select n_f Pareto-optimal decvar VECTORS to sample with the FOM, spread
-    evenly across the objective front (``obj_col``, e.g. cost -- which orders the trade-off). Returns an
-    (n_f x len(decvars)) DataFrame of full decvar combos (f_treat + per-screen toggles). With a single
-    decvar this reduces to the f_treat spread; with many it samples the decision-relevant front in the
-    FULL decvar space (the 1-D density sampler infill_ftreat does not generalise to N-D). Optional
-    active-learning: prev_res=(obj_locs, residual) biases the spread toward large emulator-vs-FOM error."""
+def _lhs(n, bounds, rng):
+    """Latin-hypercube sample: n rows, one stratified column per (lo, hi) in bounds -- space-filling."""
+    d = len(bounds)
+    u = (np.arange(n)[:, None] + rng.random((n, d))) / n
+    for j in range(d):
+        rng.shuffle(u[:, j])
+    lo = np.array([b[0] for b in bounds], float)
+    hi = np.array([b[1] for b in bounds], float)
+    return lo + u * (hi - lo)
+
+
+def infill_points(archive, decvars, n_f, obj_col="cost", explore_bounds=None, explore_frac=0.5, seed=0):
+    """Multi-decvar infill: n_f decvar VECTORS to sample with the FOM, split EXPLOIT + EXPLORE so the
+    wave is diverse in the full decvar space (not just the -- possibly collapsed -- current front):
+
+      * EXPLOIT (1-explore_frac): Pareto-optimal combos from the archive, spread across the objective
+        front (obj_col=cost) -- refines the decision-relevant region;
+      * EXPLORE (explore_frac): a Latin-hypercube over the full decvar bounds (explore_bounds, a dict
+        decvar->(lo,hi)) -- space-filling coverage so the DSI learns the forecast response across the
+        WHOLE screen-config space (free knobs the front alone never samples).
+
+    Always returns exactly n_f rows (tops up with explore if the archive is tiny/empty), so a thinned
+    archive still yields a full pool-filling wave. explore_bounds=None -> exploit only (legacy)."""
+    cols = [d for d in decvars if d in archive.columns]
     arc = archive.dropna(subset=[obj_col]).sort_values(obj_col).reset_index(drop=True)
-    cols = [d for d in decvars if d in arc.columns]
-    n = len(arc)
-    if n <= n_f:
-        return arc.loc[:, cols].reset_index(drop=True)
-    if prev_res is not None and len(prev_res[0]) > 1:              # active-learning weighting over the front
-        rc, rv = np.asarray(prev_res[0], float), np.asarray(prev_res[1], float)
-        rv = rv / (rv.max() + 1e-12)
-        order = np.argsort(rc)
-        rhat = np.interp(arc[obj_col].values, rc[order], rv[order], left=rv[order][0], right=rv[order][-1])
-        w = 1.0 + beta * rhat
-        cdf = np.cumsum(w / w.sum())
-        idx = np.clip(np.searchsorted(cdf, (np.arange(n_f) + 0.5) / n_f), 0, n - 1)
-    else:                                                          # even spread across the front
-        idx = np.linspace(0, n - 1, n_f).round().astype(int)
-    return arc.iloc[idx].loc[:, cols].reset_index(drop=True)
+    n_explore = min(n_f, round(explore_frac * n_f)) if explore_bounds else 0
+    n_exploit = min(n_f - n_explore, len(arc))
+    parts = []
+    if n_exploit > 0:                                             # spread across the front
+        idx = np.linspace(0, len(arc) - 1, n_exploit).round().astype(int)
+        parts.append(arc.iloc[idx].loc[:, cols].reset_index(drop=True))
+    n_need = n_f - sum(len(p) for p in parts)
+    if n_need > 0 and explore_bounds:                            # space-filling LHS over the full decvar box
+        rng = np.random.default_rng(seed)
+        X = _lhs(n_need, [explore_bounds[d] for d in cols], rng)
+        parts.append(pd.DataFrame(X, columns=cols))
+    return pd.concat(parts, axis=0, ignore_index=True).iloc[:n_f].reset_index(drop=True)
 
 
 def _fom_training_rows(master_dir, sweep_template=WS7_SWEEP, s3_template=WS3, index_prefix="i"):
@@ -3647,29 +3661,30 @@ def run_fom_infill(pe_path, master_dir, num_workers, template_ws=WS7_SWEEP, cond
                           condor_kwargs=condor_kwargs)
 
 
-def seed_dvpop_from_archive(prev_master, dsivc_template, seed=0):
-    """WARM-START the next iteration's MOU: overwrite the freshly-drawn (random uniform) initial dv
-    population with the PREVIOUS iteration's Pareto-optimal decvars, so the optimizer refines the front
-    on the retrained emulator instead of re-exploring from scratch. Sized to mou_population_size: if the
-    archive has more members, take an even spread across the decvar range; if fewer, pad with uniform
-    draws for diversity."""
+def seed_dvpop_from_archive(prev_master, dsivc_template, seed=0, fresh_frac=0.5):
+    """WARM-START the next iteration's MOU: overwrite the freshly-drawn initial dv population with a MIX
+    of the previous iteration's Pareto elites AND fresh uniform draws, so the optimizer refines the front
+    without collapsing to clones (a pure-archive seed, especially from a thinned archive, converges
+    prematurely). Injects up to (1-fresh_frac) of the population from the archive (even spread, combos
+    preserved) and fills at least fresh_frac with fresh space-filling diversity."""
     import pyemu
     dsivc_template = Path(dsivc_template)
     pst = pyemu.Pst(str(dsivc_template / "dsivc.pst"))
     dv = pst.adj_par_names
     mou_pop = int(pst.pestpp_options.get("mou_population_size", 2 * len(dv)))
+    lo = pst.parameter_data.loc[dv, "parlbnd"].astype(float).values
+    hi = pst.parameter_data.loc[dv, "parubnd"].astype(float).values
     arc = pd.read_csv(Path(prev_master) / "dsivc.archive.dv_pop.csv").set_index("real_name")
     vals = arc[dv].astype(float).values                 # (n_arc, n_dv) -- ROWS are Pareto combos; keep intact
-    n = vals.shape[0]
-    if n >= mou_pop:                                    # even spread of WHOLE members (preserve decvar combos)
-        idx = np.linspace(0, n - 1, mou_pop).round().astype(int)
-        seed_vals = vals[idx]
-    else:                                               # use all + pad with uniform draws to mou_pop
-        rng = np.random.default_rng(seed)
-        lo = pst.parameter_data.loc[dv, "parlbnd"].astype(float).values
-        hi = pst.parameter_data.loc[dv, "parubnd"].astype(float).values
-        pad = rng.uniform(lo, hi, size=(mou_pop - n, len(dv)))
-        seed_vals = np.vstack([vals, pad])
+    n_arch = min(vals.shape[0], mou_pop - max(1, round(fresh_frac * mou_pop)))   # archive elites (cap for diversity)
+    rng = np.random.default_rng(seed)
+    if n_arch > 0:
+        idx = np.linspace(0, vals.shape[0] - 1, n_arch).round().astype(int)      # even spread of whole members
+        elites = vals[idx]
+    else:
+        elites = np.empty((0, len(dv)))
+    fresh = rng.uniform(lo, hi, size=(mou_pop - elites.shape[0], len(dv)))       # fresh space-filling diversity
+    seed_vals = np.vstack([elites, fresh])
     df = pd.DataFrame(seed_vals, columns=dv, index=[f"seed_{i}" for i in range(mou_pop)])
     for p in pst.par_names:                             # carry any non-decvar pars at their control value
         if p not in dv:
@@ -3678,7 +3693,8 @@ def seed_dvpop_from_archive(prev_master, dsivc_template, seed=0):
     pe.enforce()
     out = dsivc_template / pst.pestpp_options.get("mou_dv_population_file", "initial_dvpop.jcb")
     pe.to_binary(str(out))
-    print(f"  [warm-start] seeded {mou_pop} initial decvars from {arc.shape[0]} Pareto members -> {out.name}")
+    print(f"  [warm-start] seeded {mou_pop} initial decvars = {elites.shape[0]} archive elites "
+          f"(of {arc.shape[0]}) + {fresh.shape[0]} fresh -> {out.name}")
     return pe
 
 
@@ -3694,8 +3710,9 @@ def _front_shift(arc, arc_prev, p95_col, npts=50):
     return float(np.max(np.abs(np.interp(grid, a["cost"], a[p95_col]) - np.interp(grid, b["cost"], b[p95_col]))))
 
 
-def run_dsivc_outer_loop(n_iters=10, gens_per_iter=3, num_workers=None, condor_kwargs=None,
-                         alpha=0.6, beta=3.0, conv_tol=1.0, seed=20260707, loop_dir=WS7_LOOP):
+def run_dsivc_outer_loop(n_iters=10, gens_per_iter=50, mou_pop=100, explore_frac=0.5,
+                         num_workers=None, condor_kwargs=None, alpha=0.6, beta=3.0, conv_tol=1.0,
+                         seed=20260707, loop_dir=WS7_LOOP):
     """Iterative FOM-retrain outer loop (ADR-0003). Each iteration: run a short (gens_per_iter) MOU on
     the current DSI (WARM-STARTED from the previous Pareto front), pick n_f Pareto-optimal decvar vectors
     spread across the cost front (infill_points -- generalises to the full f_treat + per-screen decvar
@@ -3725,21 +3742,26 @@ def run_dsivc_outer_loop(n_iters=10, gens_per_iter=3, num_workers=None, condor_k
         it.mkdir(exist_ok=True)
         tdir, rstore, mdir = it / "dsivc_template", it / "runstore", it / "master"
 
-        # 1. build + short MOU on the current DSI (decvar-only conditioning, training as-is).
-        #    WARM-START from iter k-1's Pareto front so the loop refines rather than re-explores.
-        build_dsivc(train, dsivc_template=tdir, runstore=rstore, mou_gens=gens_per_iter, training="asis")
+        # 1. build + MOU on the current DSI (decvar-only conditioning, training as-is).
+        #    WARM-START from iter k-1's Pareto front (archive elites + fresh diversity) so the loop
+        #    refines the front without collapsing to clones.
+        build_dsivc(train, dsivc_template=tdir, runstore=rstore, mou_gens=gens_per_iter,
+                    mou_pop=mou_pop, training="asis")
         if prev_master is not None:
             seed_dvpop_from_archive(prev_master, tdir, seed=seed + k)
         run_dsivc_mou(dsivc_template=tdir, master_dir=mdir, num_workers=num_workers, condor_kwargs=condor_kwargs)
         arc = _pl.load_archive(str(mdir))
 
-        # 2-3. infill: n_f Pareto-optimal DECVAR VECTORS (f_treat + screen toggles), spread across the
-        #      cost front. Read the full archive dv_pop (all decvars) + cost for the front ordering.
+        # 2-3. infill: n_f DECVAR VECTORS, EXPLOIT (Pareto front, spread across cost) + EXPLORE (LHS over
+        #      the full decvar box) so the FOM wave stays diverse in the whole screen-config space even
+        #      when the front thins. Read the full archive dv_pop (all decvars) + cost for the ordering.
         decvars = ["f_treat"] + [d for d in SCREEN_DVS if d in train.columns]
         dvpop = pd.read_csv(mdir / "dsivc.archive.dv_pop.csv").set_index("real_name")
         obpop = pd.read_csv(mdir / "dsivc.archive.obs_pop.csv").set_index("real_name")
         front = dvpop.join(obpop["cost"])
-        dv_points = infill_points(front, decvars, n_f, obj_col="cost")
+        ebounds = {d: (0.0, F_TREAT_BOUNDS[1]) if d == "f_treat" else (0.0, 1.0) for d in decvars}
+        dv_points = infill_points(front, decvars, n_f, obj_col="cost", explore_bounds=ebounds,
+                                  explore_frac=explore_frac, seed=seed + k)
 
         # 4-5. paired-CRN FOM wave at those decvar combos
         pe_path = it / "infill_pe.jcb"
