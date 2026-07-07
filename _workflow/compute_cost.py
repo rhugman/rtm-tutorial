@@ -45,7 +45,7 @@ def main(ws="."):
         raise ValueError(f"f_treat out of range [0,1): {f}")
     v_inj = float(np.loadtxt(ws / VINJ_FILE))
     cost = C_UNIT * v_inj * (-np.log(1.0 - f))         # convex; -> inf as f_treat -> 1
-    pd.DataFrame({"name": ["cost"], "value": [cost]}).to_csv(ws / COST_OBS_FILE, index=False)
+    pd.DataFrame({"item": ["cost"], "value": [cost]}).to_csv(ws / COST_OBS_FILE, index=False)
     print(f"  [compute_cost] f_treat={f:.4f}  V_inj={v_inj:.3e}  cost={cost:.6g}")
     return cost
 

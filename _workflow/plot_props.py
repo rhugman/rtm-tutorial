@@ -83,6 +83,14 @@ def _section(mg):
     return {"line": [(x0, ysec), (x1, ysec)]}, x0
 
 
+def _cell_plotx(pxs, cell):
+    """Distance-along-section where PlotCrossSection actually draws a cell -- the midpoint of its
+    projected polygon. flopy measures distance from the grid entry, not from the line's x0, so we
+    read the position back from the section rather than use (x - x0)."""
+    xs = [p[0] for p in pxs.projpts[cell]]
+    return 0.5 * (min(xs) + max(xs))
+
+
 def plot_properties(ws=OUT_WS, plan_layer=PLAN_LAYER):
     apply_style()
     ws = Path(ws)
@@ -121,7 +129,8 @@ def plot_properties(ws=OUT_WS, plan_layer=PLAN_LAYER):
         pxs = flopy.plot.PlotCrossSection(model=gwf, ax=axx, line=line, geographic_coords=False)
         imx = pxs.plot_array(arr, cmap=cmap, norm=norm, vmin=vmin, vmax=vmax)
         for nm, (x, y) in wells.items():
-            axx.axvline(x - x0, color="k", lw=0.7, ls=":", alpha=0.6)
+            wc = int(ix.intersect([(x, y)], "point").cellids[0])
+            axx.axvline(_cell_plotx(pxs, wc), color="k", lw=0.7, ls=":", alpha=0.6)
         axx.set_ylabel("elev (m)", fontsize=9)
         if row == 0:
             axx.set_title("cross-section (well axis)", fontsize=11)

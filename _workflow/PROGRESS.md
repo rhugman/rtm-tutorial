@@ -305,6 +305,25 @@ unless requested. Full 36-real IES LOO now ~8min (was ~1.75hr). regen relaunched
 (NB: user originally ADDED autoadaloc for calibration quality; dropped here for speed -- the DSI has only
 ~119 latent pars so localization buys little. If conditioning quality regresses, reconsider.)
 
+## SECTION 7 BUILD -- DSIVC sweep interface + run (2026-07-07)
+- build_sweep_interface = build_pest_interface(with_treatment=True): f_treat tpl param [0,0.999],
+  ftreat+cost obs, apply_treatment_forward PRE cmd. Two build bugs fixed:
+  (1) obs index_cols=["name"] clashed with PstFrom's obsnme alias 'name' on RELOAD -> renamed to 'item'.
+  (2) FORWARD-RUN EMBEDDING: add_py_function embeds only ONE function's source (self-contained, like
+      apply_well_rates). apply_treatment_forward calls apply_treatment -> the whole PhreeqcRM chem chain
+      + module constants -> can't embed. FIX: apply_treatment_forward is now a self-contained STUB that
+      imports the workflow module (shipped into the template) and delegates to _apply_treatment_forward_impl.
+      with_treatment build ships into the template: workflow.py, wf_style.py, herebedragons.py, and the 6
+      chem-data files build_injectate_solutions reads (ic_aq_chem.csv, wellin.csv, ic_exchanger.csv,
+      ic_surfaces.csv, postfix.phqr, datab.dat). Stub sets MPLBACKEND=Agg + sys.path.insert(cwd) and calls
+      _wf._apply_treatment_forward_impl(ws, data_d=ws) so the copied CSVs are used (module DATA_D would be
+      wrong in-worker). Verified worker-style: f_treat=0.5 -> cost=100.1, ftreat/cost obs written.
+- draw_sweep_ensemble: reuse prior_pe.jcb 120 param reals + f_treat~U[0,0.999] (paired). SLIM the sweep
+  template (remove sout.csv/*.ucn) before the worker run (disk).
+- SWEEP RUNNING bn7lwqpgx: run_dsivc_sweep(12 workers, 120 reals). F=0, all workers ran treatment
+  (ftreat.csv written) + into mf6rtm. ~60-80min. First attempt (bx3qayr8o) failed 120/120 fast on the
+  embedding bug -> fixed. NEXT after it lands: merge_training_data (240-real) + build_dsivc.
+
 ## SECTION 7 -- DSIVC optimization (DESIGN LOCKED 2026-07-06, not yet built)
 
 Framing: ADR-0003 f_treat lever (SUPERSEDES the old three-well dv-rate design in memory dsivc-part1-08).

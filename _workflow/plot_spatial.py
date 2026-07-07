@@ -119,6 +119,14 @@ def plot_plan(gwf, hds, ucn, layer=PLAN_LAYER, name="spatial_plan_so4", stage=ST
     return savefig(fig, name, stage)
 
 
+def _cell_plotx(pxs, cell):
+    """Distance-along-section where PlotCrossSection actually draws a cell -- the midpoint of its
+    projected polygon. flopy measures distance from the grid entry, not from the line's x0, so we
+    read the position back from the section rather than use (x - x0)."""
+    xs = [p[0] for p in pxs.projpts[cell]]
+    return 0.5 * (min(xs) + max(xs))
+
+
 def plot_xsection(gwf, hds, ucn, name="spatial_xsection_so4", stage=STAGE, title_tag=""):
     apply_style()
     mg = gwf.modelgrid
@@ -132,22 +140,23 @@ def plot_xsection(gwf, hds, ucn, name="spatial_xsection_so4", stage=STAGE, title
     x1 = float(np.max(mg.xcellcenters)) + 2.0
     line = {"line": [(x0, ysec), (x1, ysec)]}
 
-    # well cells (for screen z) + plot-x (distance along the horizontal line = x - x0)
+    # well cells (for screen z + plot-x). PlotCrossSection measures distance-along-line from where
+    # the line enters the grid, NOT from the line's x0 start, so (x - x0) lands 1-2 cells off; we
+    # read each cell's drawn position back from the section instead (see _cell_plotx).
     ix = GridIntersect(mg)
     wcell = {nm: int(ix.intersect([(x, y)], "point").cellids[0])
              for nm, (x, y) in WELLS.items()}
     botm = np.asarray(mg.botm)
     top = np.asarray(mg.top)
 
-    def screen_segments(nm):
+    def screen_segments(nm, px):
         cell = wcell[nm]
-        px = WELLS[nm][0] - x0
         segs = []
         for L in SCREENS[nm]:
             ztop = float(top[cell]) if L == 0 else float(botm[L - 1, cell])
             zbot = float(botm[L, cell])
             segs.append((px, zbot, ztop))
-        return px, segs
+        return segs
 
     fig, axes = plt.subplots(len(TIMES), 1, figsize=(11, 3.0 * len(TIMES)), sharex=True)
     im = None
@@ -159,7 +168,8 @@ def plot_xsection(gwf, hds, ucn, name="spatial_xsection_so4", stage=STAGE, title
         ax.clabel(cs, fmt="%.0f", fontsize=7, inline=True)
         pxs.plot_grid(lw=0.15, color="0.7", alpha=0.35)
         for nm in WELLS:
-            px, segs = screen_segments(nm)
+            px = _cell_plotx(pxs, wcell[nm])
+            segs = screen_segments(nm, px)
             col = C["red"] if nm == "wellin" else C["blue"]
             zmin = min(s[1] for s in segs)
             zmax = max(s[2] for s in segs)
@@ -231,6 +241,9 @@ def plot_field_snapshots(model_ws, fields, name, stage, title_tag="", layer=PLAN
     x0 = float(np.min(mg.xcellcenters)) - 2.0
     x1 = float(np.max(mg.xcellcenters)) + 2.0
     line = {"line": [(x0, ysec), (x1, ysec)]}
+    ix = GridIntersect(mg)
+    wcell = {nm: int(ix.intersect([(x, y)], "point").cellids[0])
+             for nm, (x, y) in {"wellin": (1.0, 0.0), "wellout": (-99.0, 0.0)}.items()}
 
     fig, axes = plt.subplots(len(snaps), 2, figsize=(13, 2.9 * len(snaps)),
                              gridspec_kw={"width_ratios": [2, 3]})
@@ -250,8 +263,8 @@ def plot_field_snapshots(model_ws, fields, name, stage, title_tag="", layer=PLAN
         axx = axes[row, 1]
         pxs = flopy.plot.PlotCrossSection(model=gwf, ax=axx, line=line, geographic_coords=False)
         pxs.plot_array(arr, cmap=CMAP, vmin=0, vmax=vmax, masked_values=MASK)
-        for nm, (x, y) in {"wellin": (1.0, 0.0), "wellout": (-99.0, 0.0)}.items():
-            axx.axvline(x - x0, color="k", lw=0.7, ls=":", alpha=0.6)
+        for nm in ("wellin", "wellout"):
+            axx.axvline(_cell_plotx(pxs, wcell[nm]), color="k", lw=0.7, ls=":", alpha=0.6)
         axx.set_ylabel("elev (m)", fontsize=9)
         if row == 0:
             axx.set_title("cross-section (well axis)", fontsize=11)

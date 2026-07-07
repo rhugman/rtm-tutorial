@@ -118,11 +118,18 @@ def _section(mg):
     return {"line": [(x0, ysec), (x1, ysec)]}, ysec, x0
 
 
-def _screen_segments(mg, ix, nm, x0):
+def _cell_plotx(pxs, cell):
+    """Distance-along-section where PlotCrossSection actually draws a cell -- the midpoint of its
+    projected polygon. flopy measures distance from the grid entry, not from the line's x0, so we
+    read the position back from the section rather than use (x - x0)."""
+    xs = [p[0] for p in pxs.projpts[cell]]
+    return 0.5 * (min(xs) + max(xs))
+
+
+def _screen_segments(mg, ix, nm, px):
     cell = int(ix.intersect([WELLS[nm]], "point").cellids[0])
     botm = np.asarray(mg.botm)
     top = np.asarray(mg.top)
-    px = WELLS[nm][0] - x0
     segs = []
     for L in SCREENS[nm]:
         ztop = float(top[cell]) if L == 0 else float(botm[L - 1, cell])
@@ -147,7 +154,8 @@ def fig_xsection_layout(gwf):
     # well screens
     for nm in WELLS:
         col = C["red"] if nm == "wellin" else C["blue"]
-        px, segs = _screen_segments(mg, ix, nm, x0)
+        wc = int(ix.intersect([WELLS[nm]], "point").cellids[0])
+        px, segs = _screen_segments(mg, ix, nm, _cell_plotx(pxs, wc))
         ax.plot([px, px], [min(s[1] for s in segs), max(s[2] for s in segs)],
                 color=col, lw=1.0, alpha=0.6, zorder=6)
         for (pxx, zb, zt) in segs:
@@ -163,7 +171,7 @@ def fig_xsection_layout(gwf):
         L = int(r.layer)
         ztop = float(top[cell]) if L == 0 else float(botm[L - 1, cell])
         zc = 0.5 * (ztop + float(botm[L, cell]))
-        ax.scatter([r.x - x0], [zc], s=26, marker="s", facecolor="none",
+        ax.scatter([_cell_plotx(pxs, cell)], [zc], s=26, marker="s", facecolor="none",
                    edgecolor=C["green"], linewidths=1.2, zorder=9)
 
     ax.set_xlabel(f"distance along well axis (m); x0 = {x0:.0f} m")

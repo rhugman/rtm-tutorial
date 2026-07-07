@@ -790,20 +790,39 @@ def apply_treatment(ws, f_treat, data_d=DATA_D):
 
 
 def apply_treatment_forward(ws="."):
-    """FORWARD-RUN pre-command for the DSIVC sweep: read ``f_treat`` from ``treatment.dat``, apply
-    the forecast-only treatment (rewrites the wellin aux + writes cost.dat), and echo ``f_treat`` +
-    ``cost`` as one-row obs CSVs.
+    """FORWARD-RUN pre-command (SELF-CONTAINED stub embedded verbatim into forward_run.py).
 
-    Runs AFTER ``apply_well_rates`` (which sets the wellin/wellout rates) so the treated aux lands on
-    the final rate schedule, and BEFORE ``copy_parameterized_transport_files`` + ``mf6rtm``. ``f_treat``
-    is echoed to ``ftreat.csv`` so DSIVC can control it as an OBS column (the decision variable is a
-    "controllable observation"). At ``f_treat=0`` this reproduces the baseline (regression invariant).
+    The treatment chain (PhreeqcRM re-equilibration of the injectate SOLUTIONs + surgical wellin-aux
+    rewrite + module constants like DAY_COND_END) is far too large to inline the way apply_well_rates
+    is, so instead we IMPORT the workflow module -- shipped into the template alongside wf_style.py and
+    the four chem-data CSVs at build time (with_treatment) -- and delegate to the real implementation.
+    Runs in the worker's cwd: treatment.dat + the data CSVs live there.
+
+    Order: after apply_well_rates (final rate schedule), before copy_parameterized_transport_files +
+    mf6rtm. Echoes f_treat to ftreat.csv (DSIVC's controllable-obs decvar) and cost to cost_obs.csv.
     """
+    import os
+    import sys
+    from pathlib import Path
+    os.environ.setdefault("MPLBACKEND", "Agg")               # headless worker: no GUI matplotlib backend
+    ws = str(Path(ws).resolve())
+    if ws not in sys.path:
+        sys.path.insert(0, ws)
+    import workflow as _wf
+    _wf._apply_treatment_forward_impl(ws, data_d=ws)
+
+
+def _apply_treatment_forward_impl(ws=".", data_d=None):
+    """The real treatment forward-run logic (called via the imported workflow module in-worker, or
+    directly at build time with data_d=DATA_D). Reads f_treat from treatment.dat, applies forecast-only
+    treatment (rewrites the wellin aux + writes cost.dat), and echoes f_treat + cost as one-row obs CSVs.
+    index col is 'item', NOT 'name' -- PstFrom treats 'name' as an obsnme alias (reload clash)."""
     ws = Path(ws)
+    data_d = data_d if data_d is not None else DATA_D
     f_treat = float(np.loadtxt(ws / "treatment.dat"))
-    cost = apply_treatment(str(ws), f_treat)                 # rewrites wellin aux + writes cost.dat
-    pd.DataFrame({"name": ["f_treat"], "value": [f_treat]}).to_csv(ws / "ftreat.csv", index=False)
-    pd.DataFrame({"name": ["cost"], "value": [cost]}).to_csv(ws / "cost_obs.csv", index=False)
+    cost = apply_treatment(str(ws), f_treat, data_d=data_d)   # rewrites wellin aux + writes cost.dat
+    pd.DataFrame({"item": ["f_treat"], "value": [f_treat]}).to_csv(ws / "ftreat.csv", index=False)
+    pd.DataFrame({"item": ["cost"], "value": [cost]}).to_csv(ws / "cost_obs.csv", index=False)
     print(f"  [apply_treatment_forward] f_treat={f_treat:.4f}  cost={cost:.4g}")
 
 
@@ -1394,10 +1413,19 @@ def build_pest_interface(model_ws=WS, template_ws=WS3, num_reals=N_REALS, with_t
 
     if with_treatment:                                           # DSIVC sweep: f_treat (decvar) + cost as obs
         (template_ws / "treatment.dat").write_text("0.0\n")      # baseline; tpl added post-build_pst
-        apply_treatment_forward(ws=str(template_ws))             # -> ftreat.csv + cost_obs.csv at f_treat=0
-        pf.add_observations("ftreat.csv", index_cols=["name"], use_cols="value",
+        # the worker runs the treatment by IMPORTING workflow -> ship the modules it needs (workflow +
+        # wf_style + herebedragons) and every chem-data file build_injectate_solutions reads.
+        wfdir = Path(__file__).resolve().parent
+        shutil.copy(wfdir / "workflow.py", template_ws / "workflow.py")
+        shutil.copy(wfdir / "wf_style.py", template_ws / "wf_style.py")
+        shutil.copy(TUT / "herebedragons.py", template_ws / "herebedragons.py")
+        for _f in ("ic_aq_chem.csv", "wellin.csv", "ic_exchanger.csv", "ic_surfaces.csv",
+                   "postfix.phqr", "datab.dat"):
+            shutil.copy(DATA_D / _f, template_ws / _f)
+        _apply_treatment_forward_impl(str(template_ws), data_d=str(DATA_D))  # -> ftreat.csv + cost_obs.csv (f_treat=0)
+        pf.add_observations("ftreat.csv", index_cols=["item"], use_cols="value",
                             prefix="ftreat", obsgp="ftreat")     # the controllable-obs decvar
-        pf.add_observations("cost_obs.csv", index_cols=["name"], use_cols="value",
+        pf.add_observations("cost_obs.csv", index_cols=["item"], use_cols="value",
                             prefix="cost", obsgp="cost")         # exact cost (carried; excluded from DSI train)
 
     # --- parameters: uncertain aquifer properties -------------------------------------------
