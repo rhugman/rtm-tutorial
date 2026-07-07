@@ -3327,6 +3327,9 @@ def build_dsivc(merged=None, dsivc_template=WS7_DSIVC, runstore=WS7_DSIVC_RUNSTO
     pst = dv.prepare_pestpp(str(dsivc_template), decvar_names=["f_treat"],
                             percentiles=(round(1.0 - so4_pct, 4), so4_pct),
                             inner_noptmax=inner_noptmax, mou_population_size=mou_pop,
+                            decvar_weight=1000.0,            # std ~0.001 on f_treat -> pin it hard, else the
+                                                            # inner conditioning barely constrains it and the
+                                                            # posterior SO4 stays at the prior mean (degenerate)
                             ies_exe_path="./pestpp-ies")     # local 5.2.24 (PATH pestpp-ies 5.2.16 rejects /e)
 
     # (e) exact cost -- compute_cost.py as a 2nd model command (deterministic in f_treat, never emulated)
