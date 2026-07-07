@@ -404,7 +404,22 @@ delete stale outputs. (2) stage7 marker is the SWEEP obs.jcb, so once the sweep 
 stage7 (merge + build_dsivc too) -- run --stage7merge / --stage7 to build the DSIVC after a completed sweep
 (revisit once build_dsivc has a real MOU output artifact to key on).
 
-## SECTION 7 -- DSIVC optimization (DESIGN LOCKED 2026-07-06, not yet built)
+## SECTION 7 -- DSIVC optimization BUILT (2026-07-07) -- pestpp-mou over the emulator
+build_dsivc now IMPLEMENTED (was scaffold). Flow: fit DSI on merged (227x2347, f_treat + fore_peak_so4
+are obs cols) -> dsi.prepare_pestpp(use_runstor) -> set baseline-truth conditioning on the inner dsi.pst
+(targets from _truth/truth_obs.csv + 1/obs_sigma weights + correlated obs+noise ensemble w/ fill=True so
+f_treat is a column DSIVC needs) -> DSIVC(...).prepare_pestpp(decvar=['f_treat'], percentiles=(0.05,0.95),
+ies_exe_path='./pestpp-ies') -> add EXACT cost (compute_cost.py 2nd model_command + v_inj.dat + cost obs)
+-> objectives min(cost, fore_peak_so4_stat:95%) obgnme 'less_than', mou_objectives. mou_generator='de',
+mou_env_selector='nsga' (NOT nsga2 -- that's neither a generator nor a selector name), noptmax=mou_gens.
+run_dsivc_mou deploys pestpp-mou (HTCondor/local). LEVERAGE confirmed corr(f_treat,peak-SO4)=-0.577.
+Bugs fixed while building: (1) DSIVC needs oe fill=True (f_treat zero-weight -> was dropped from noise);
+(2) nested /e needs ./pestpp-ies 5.2.24 (PATH's 5.2.16 rejects /e); (3) dropped ies_phi_factor_file for the
+inner (DSIVC-weighted f_treat's default group breaks the phi file); (4) mou_generator=de, env_selector=nsga.
+VERIFIED: forward run at f_treat=0 -> peak-SO4 P95=35.0, cost=0; pestpp-mou runs (12pop x 6gen serial test).
+Sweep landed 107/120 (13 timed out on CPU contention). NEXT: read the front; FOM-validate the optimum.
+
+## SECTION 7 -- DSIVC optimization (DESIGN LOCKED 2026-07-06, superseded above)
 
 Framing: ADR-0003 f_treat lever (SUPERSEDES the old three-well dv-rate design in memory dsivc-part1-08).
 DSIVC = outer pestpp-mou over the DSI emulator; decvar is an OBS COLUMN the manager controls, injected

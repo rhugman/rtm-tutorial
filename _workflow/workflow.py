@@ -3154,6 +3154,7 @@ _S7_WORKER_ROOT = Path(__file__).parent / "_s7_workers"
 WS7_DSIVC = Path(__file__).parent / "_s7_dsivc_template"      # runstore DSI + DSIVC (mou) template
 WS7_DSIVC_MASTER = Path(__file__).parent / "_s7_dsivc_master"
 _S7_DSIVC_WORKER_ROOT = Path(__file__).parent / "_s7_dsivc_workers"
+WS7_DSIVC_RUNSTORE = Path(__file__).parent / "_s7_dsivc_runstore"   # runstore DSI (dsi_t_d for DSIVC)
 N_SWEEP = N_PRIOR_MC                                          # paired with the prior MC -- MUST match
 
 
@@ -3249,53 +3250,114 @@ def merge_training_data(prior_master=WS5_MASTER, prior_template=WS3,
     return merged, fore
 
 
-def build_dsivc(merged=None, dsivc_template=WS7_DSIVC, truth_real="5", so4_percentile=0.95):
-    """SCAFFOLD (draft): fit the DSI on the merged 240-real ensemble, condition on the baseline truth
-    (inject f_treat=0), prepare the runstore DSI, wrap DSIVC over it with f_treat as the decvar, and
-    declare the two objectives for pestpp-mou. Not yet run -- the stack-stats obs names emitted by
-    DSIVC.prepare_pestpp must be confirmed against the first output before the objective wiring is final.
+def build_dsivc(merged=None, dsivc_template=WS7_DSIVC, runstore=WS7_DSIVC_RUNSTORE, template_ws=WS3,
+                model_ws=WS, truth_dir=None, seed=20260706, so4_pct=0.95, inner_noptmax=3,
+                mou_pop=40, mou_gens=20, num_reals=300):
+    """DSIVC outer optimization over the merged-trained DSI emulator: minimize treatment COST vs
+    minimize P<so4_pct> peak recovered-SO4, decision variable f_treat.
 
-    Steps (each maps to PROGRESS.md SECTION 7 build steps d-h):
-      d. fit ONE DSI on `merged` (f_treat is a varying obs column; fore_peak_so4 is the emulated target)
-      e. condition on truth: inject the baseline truth's weighted obs AND f_treat=0, run -> posterior oe
-      f. DSIVC(emulator, runstore_dsi_t_d, posterior_oe).prepare_pestpp(decvar_names=["f_treat"])
-      g. objectives: min `cost` (compute_cost.py 2nd command) + min `fore_peak_so4_stat:95%`; pestpp-mou
-      h. FOM-validate the optimum f_treat through the full model vs the emulated P5-P95 band
+    (a) fit the DSI on the merged (prior + sweep) training set -- f_treat + fore_peak_so4 are obs columns
+    (b) runstore-prepare the emulator (dsi.pst + dsi.pickle + fwd run)
+    (c) set the BASELINE-TRUTH conditioning on the inner dsi.pst (targets from _truth + proportional
+        1/obs_sigma weights + per-site:species phi factors) + a correlated obs-noise ensemble DSIVC
+        harvests (dsi.obs+noise.jcb), so every inner run conditions on the monitored data AND the
+        injected f_treat
+    (d) DSIVC.prepare_pestpp(decvar=f_treat, percentiles=(1-so4_pct, so4_pct)) -> outer dsivc.pst
+    (e) wire the EXACT cost as a 2nd model command (compute_cost.py + v_inj.dat) -> `cost` obs
+    (f) declare objectives: min cost + min fore_peak_so4_stat:<pct>% (obs group 'less_than', non-zero
+        weight, mou_objectives)
+    Returns the outer pst; deploy the pestpp-mou run with run_dsivc_mou.
     """
     from pyemu.emulators import DSI, DSIVC
     import pyemu
+    import herebedragons as hbd
+    import flopy
+
+    dsivc_template, runstore, template_ws = Path(dsivc_template), Path(runstore), Path(template_ws)
+    truth_dir = Path(truth_dir) if truth_dir else (Path(__file__).parent / "_truth")
     if merged is None:
         merged, _fore = merge_training_data()
-    dsivc_template = Path(dsivc_template)
 
-    # (d) fit the emulator on the merged ensemble (truth held out of training)
-    train = merged.drop(index=[str(truth_real)], errors="ignore")
-    dsi = DSI(data=train, transforms=DSI_TRANSFORMS, energy_threshold=DSI_ENERGY).fit()
-    print(f"  [build_dsivc] DSI fit: train={train.shape[0]} obs_cols={train.shape[1]} latent_dim={dsi.latent_dim}")
+    # (a) DSI on the merged ensemble
+    dsi = DSI(data=merged, transforms=DSI_TRANSFORMS, energy_threshold=DSI_ENERGY).fit()
 
-    # (e) TODO: condition on the baseline truth (reuse build_dsi_conditioning weighting/noise/phi-factors,
-    #     but on THIS emulator and with f_treat injected = 0 as a high-weight target) -> posterior oe.
-    #     dpst = dsi.prepare_pestpp(runstore_dsi_t_d, use_runstor=True); hbd.get_bins(runstore_dsi_t_d)
-    #     ... set targets/weights/phi/noise exactly as build_dsi_conditioning ... + f_treat target=0 ...
-    #     run_dsi(runstore_dsi_t_d); posterior_oe = ObservationEnsemble.from_binary(dsi.<last>.obs.jcb)
-    #
-    # (f) DSIVC over the runstore DSI, f_treat as the controllable decvar
-    #     dv = DSIVC(emulator=dsi, dsi_t_d=str(runstore_dsi_t_d), oe=posterior_oe)
-    #     pst_mou = dv.prepare_pestpp(str(dsivc_template), decvar_names=["f_treat"],
-    #                                 percentiles=(0.05, so4_percentile))   # P5/P95 stack-stats
-    #
-    # (g) objectives on the stack-stats + exact cost:
-    #     - add compute_cost.py as a 2nd model command (reads the injected f_treat -> writes cost obs)
-    #     - obj obs group 'less_than' (minimize), non-zero weight, listed in mou_objectives:
-    #         cost                            (exact, from compute_cost.py)
-    #         fore_peak_so4_stat:95%          (emulated risk band; NAME to confirm from prepare output)
-    #     - pst_mou.pestpp_options['mou_objectives'] = 'cost,fore_peak_so4_stat:95%'
-    #     - DEPLOY the outer pestpp-mou via run_dsivc_mou (HTCondor pool when available, else local) ->
-    #       1-D convex cost-vs-SO4 risk-banded front
-    #
-    # (h) FOM validation: run the optimum f_treat through the full model, check the peak lands in P5-P95.
-    print("  [build_dsivc] SCAFFOLD -- steps (e)-(h) pending the landed prior MC + sweep; see docstring.")
-    return dsi, train
+    # (b) runstore-prepare
+    dpst = dsi.prepare_pestpp(str(runstore), use_runstor=True)
+    hbd.get_bins(str(runstore))
+
+    # (c) baseline-truth conditioning on the inner dsi.pst (mirrors build_dsi_conditioning; truth from _truth)
+    ometa = _dsi_meta(pyemu.Pst(str(template_ws / "pest.pst")))          # lowercased index + variable
+    tvals = pd.read_csv(truth_dir / "truth_obs.csv", index_col=0)["obsval"]
+    tvals.index = tvals.index.astype(str).str.lower()
+    dobs = dpst.observation_data
+    dobs["weight"] = 0.0
+    dobs["standard_deviation"] = np.nan
+    cond = [o for o in dpst.obs_names if o in ometa.index
+            and float(ometa.loc[o, "weight"]) > 0 and o in tvals.index]
+    cm = ometa.loc[cond]
+    species = np.where(cm["obgnme"].values == "head", "head", cm["variable"].astype(str).values)
+    ovals = tvals[cond].astype(float).values
+    sig = np.array([float(obs_sigma(np.array([v]), s)[0]) for v, s in zip(ovals, species)])
+    dobs.loc[cond, "obsval"] = ovals
+    dobs.loc[cond, "standard_deviation"] = sig
+    dobs.loc[cond, "weight"] = 1.0 / sig
+    dobs.loc[cond, "obgnme"] = [f"{oid}:{s}" for oid, s in zip(cm["obsid"].astype(str).values, species)]
+    groups = pd.unique(dobs.loc[cond, "obgnme"])
+    # NB: no ies_phi_factor_file here -- DSIVC weights the f_treat decvar (a DSI-default group not in the
+    # file), which pestpp would reject; the per-obs 1/sigma weights already balance the conditioning.
+    dpst.pestpp_options["ies_drop_conflicts"] = True
+    dpst.pestpp_options.pop("ies_autoadaloc", None)
+    dpst.control_data.noptmax = inner_noptmax
+    dpst.write(str(runstore / "dsi.pst"), version=2)
+    # correlated obs-noise ensemble DSIVC harvests: one shock per site:species series per realization.
+    # fill=True keeps ALL obs as columns (incl. the zero-weight f_treat decvar), which DSIVC requires.
+    noise = pyemu.ObservationEnsemble.from_gaussian_draw(dpst, num_reals=num_reals, fill=True)
+    rng = np.random.default_rng(seed)
+    for grp, g in dobs.loc[cond].groupby("obgnme"):
+        z = rng.standard_normal(num_reals)[:, None]
+        vv = g["obsval"].astype(float).values[None, :] + z * g["standard_deviation"].astype(float).values[None, :]
+        if grp.split(":")[-1] not in ("ph", "tmp", "head"):
+            vv = np.clip(vv, 0.0, None)
+        noise._df.loc[:, g.index] = vv
+    noise.to_binary(str(runstore / "dsi.obs+noise.jcb"))
+
+    # (d) DSIVC over the conditioning-ready runstore DSI, f_treat as the controllable decvar
+    oe = pyemu.ObservationEnsemble(pst=dpst, df=merged.loc[:, dpst.obs_names])
+    dv = DSIVC(emulator=dsi, dsi_t_d=str(runstore), oe=oe)
+    pst = dv.prepare_pestpp(str(dsivc_template), decvar_names=["f_treat"],
+                            percentiles=(round(1.0 - so4_pct, 4), so4_pct),
+                            inner_noptmax=inner_noptmax, mou_population_size=mou_pop,
+                            ies_exe_path="./pestpp-ies")     # local 5.2.24 (PATH pestpp-ies 5.2.16 rejects /e)
+
+    # (e) exact cost -- compute_cost.py as a 2nd model command (deterministic in f_treat, never emulated)
+    v_inj = _compute_v_inj(flopy.mf6.MFSimulation.load(sim_ws=str(model_ws), verbosity_level=0))
+    (dsivc_template / "v_inj.dat").write_text(f"{v_inj:.10E}\n")
+    shutil.copy(Path(__file__).parent / "compute_cost.py", dsivc_template / "compute_cost.py")
+    pd.DataFrame({"item": ["cost"], "value": [0.0]}).to_csv(dsivc_template / "cost_obs.csv", index=False)
+    (dsivc_template / "cost_obs.csv.ins").write_text("pif ~\nl2 ~,~ !cost!\n")
+    pst.add_observations(str(dsivc_template / "cost_obs.csv.ins"),
+                         str(dsivc_template / "cost_obs.csv"), pst_path=".")
+    pst.model_command = ["python dsivc_forward_run.py", "python compute_cost.py"]
+
+    # (f) objectives: minimize cost + minimize P<pct> peak recovered-SO4 (obgnme 'less_than' -> minimize)
+    so4_obj = f"fore_peak_so4_stat:{int(round(so4_pct * 100))}%"
+    objs = ["cost", so4_obj]
+    obs = pst.observation_data
+    missing = [o for o in objs if o not in obs.index]
+    if missing:
+        raise RuntimeError(f"objective obs not found in dsivc.pst: {missing}")
+    obs.loc[objs, "weight"] = 1.0
+    obs.loc[objs, "obgnme"] = "less_than"
+    pst.pestpp_options["mou_objectives"] = ",".join(objs)
+    pst.pestpp_options["mou_generator"] = "de"               # offspring operator (nsga2 is the env selector)
+    pst.pestpp_options["mou_env_selector"] = "nsga"          # Pareto/crowding selection (NSGA-II)
+    pst.pestpp_options["mou_save_population_every"] = 1
+    pst.control_data.noptmax = mou_gens                       # NSGA-II generations (0 = setup only)
+    pst.write(str(dsivc_template / "dsivc.pst"), version=2)
+    print(f"  [build_dsivc] DSI(merged {merged.shape[0]}x{merged.shape[1]}) -> DSIVC decvar=f_treat; "
+          f"{len(cond)} conditioning obs / {len(groups)} phi groups; objectives min({', '.join(objs)}); "
+          f"inner noptmax={inner_noptmax}, mou_pop={mou_pop}, V_inj={v_inj:.3e}. Deploy: run_dsivc_mou.")
+    return pst
 
 
 def run_dsivc_mou(dsivc_template=WS7_DSIVC, master_dir=WS7_DSIVC_MASTER, num_workers=None,
@@ -3324,7 +3386,8 @@ def stage7_dsivc(num_workers=None, condor_kwargs=None):
     draw_sweep_ensemble(sweep_pst)
     run_dsivc_sweep(num_workers=num_workers, condor_kwargs=condor_kwargs)
     merged, _fore = merge_training_data()
-    return build_dsivc(merged)
+    build_dsivc(merged)
+    return run_dsivc_mou(num_workers=num_workers, condor_kwargs=condor_kwargs)
 
 
 def run_all(num_reals=N_PRIOR_MC, num_workers=None, condor_kwargs=None, quantile=0.75, force=False):
