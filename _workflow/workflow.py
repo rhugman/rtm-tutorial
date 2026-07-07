@@ -3405,6 +3405,60 @@ def run_dsivc_mou(dsivc_template=WS7_DSIVC, master_dir=WS7_DSIVC_MASTER, num_wor
                           condor_kwargs=condor_kwargs, pestpp_exe="pestpp-mou")
 
 
+def _infill_grid_size(n_workers):
+    """Split one FOM wave that fills the pool into (n_f f_treat locations, K paired param reals).
+    K is biased up (covariance quality for the DSI); n_f fills the remainder. Grows with the pool:
+    N=15 -> (3,4); N=60 -> (7,8); N=120 -> (10,11)."""
+    K = int(np.clip(round(np.sqrt(max(1, n_workers))), 4, 20))
+    n_f = max(3, int(n_workers) // K)
+    return n_f, K
+
+
+def infill_ftreat(archive_ft, train_ft=None, n_f=8, prev_res=None, alpha=0.6, beta=3.0,
+                  delta=None, bounds=None, ngrid=1001):
+    """Pick n_f f_treat infill locations over the Pareto-optimal decvar footprint by stratified-quantile
+    sampling of a decision-focused density (the crux of the outer-loop infill design):
+
+        w(f) = alpha*KDE(archive f_treat)            # concentrate on the Pareto knee (decision region)
+             + (1-alpha)*Uniform(domain)             # uniform floor so no region is starved
+        w(f) *= (1 + beta * rhat(f))                 # active learning: chase last iter's emulator error
+        w(f) *= min(1, dist_to_nearest_train/delta)  # OPTIONAL gap term (delta set): sparse-coverage only
+
+    The gap term is OFF by default: once f_treat coverage is dense (the sweep already lays down ~107
+    points over [0,1]), there are no gaps to fill, and each infill point re-samples with a NEW paired
+    parameter subset anyway (fresh joint samples, not duplicates) -- so landing near existing f_treat is
+    fine. Set delta (e.g. 0.03) only for a sparse from-scratch build.
+
+    ``archive_ft`` : Pareto-optimal f_treat values (MOU archive). ``train_ft`` : f_treat already in the
+    training set (gap term only). ``prev_res`` : (f_locs, |P95_emul-P95_FOM|) from the previous iteration's
+    infill points, or None on iter 1. Returns n_f locations, space-filling UNDER w (deterministic)."""
+    archive_ft = np.asarray(archive_ft, float)
+    lo, hi = bounds if bounds is not None else (float(archive_ft.min()), float(archive_ft.max()))
+    grid = np.linspace(lo, hi, ngrid)
+    # Gaussian KDE (Scott bandwidth) over the Pareto f_treat -- decision-region density
+    n = archive_ft.size
+    bw = max(1e-3, float(archive_ft.std(ddof=1)) * n ** (-0.2)) if n > 1 else (hi - lo) / 10.0
+    kde = np.exp(-0.5 * ((grid[:, None] - archive_ft[None, :]) / bw) ** 2).sum(axis=1)
+    _trap = getattr(np, "trapezoid", getattr(np, "trapz", None))    # np2 renamed trapz -> trapezoid
+    kde /= _trap(kde, grid)
+    w = alpha * kde + (1.0 - alpha) * (np.ones_like(grid) / (hi - lo))
+    if delta and train_ft is not None and len(train_ft):           # OPTIONAL gap term (sparse coverage)
+        tf = np.asarray(train_ft, float)
+        dist = np.min(np.abs(grid[:, None] - tf[None, :]), axis=1)
+        w *= np.clip(dist / delta, 0.0, 1.0)
+    if prev_res is not None and len(prev_res[0]):                   # active-learning residual term
+        rf, rv = np.asarray(prev_res[0], float), np.asarray(prev_res[1], float)
+        rv = rv / (rv.max() + 1e-12)
+        order = np.argsort(rf)
+        rhat = np.interp(grid, rf[order], rv[order], left=rv[order][0], right=rv[order][-1])
+        w *= (1.0 + beta * rhat)
+    w = np.clip(w, 1e-12, None)
+    cdf = np.cumsum(w)
+    cdf /= cdf[-1]
+    q = (np.arange(n_f) + 0.5) / n_f                                # stratified quantiles -> space-filling under w
+    return np.interp(q, cdf, grid)
+
+
 def stage7_dsivc(num_workers=None, condor_kwargs=None):
     """Section-7 orchestrator (draft): build sweep interface -> reuse-120 sweep ensemble -> run sweep ->
     merge with the prior MC -> build DSIVC. Requires the Section-5 prior MC (_s5_master) already landed.
