@@ -204,10 +204,11 @@ def fig_sweep_tradeoff(sweep_master, sweep_template):
 
 
 def _draw_overlay(fig, a0, a1, cloud, arc, tpk, cloud_label="full-model sweep",
-                  ylim=None, xlim_cost=None):
+                  new_pts=None, ylim=None, xlim_cost=None):
     """Shared 2-panel overlay used by both the static sweep-vs-front figure and the GIF frames:
     the FOM ground-truth cloud (cols f_treat/cost/peak_so4) + the DSIVC Pareto (arc) on ONE f_treat
-    colorscale. Pass fixed ylim / xlim_cost to keep axes steady across an animation."""
+    colorscale. new_pts (cols f_treat/cost/peak_so4) are highlighted as red stars -- the FOM samples
+    just added this iteration. Pass fixed ylim / xlim_cost to keep axes steady across an animation."""
     arc = arc.sort_values("f_treat").reset_index(drop=True)
     af = arc.sort_values("cost")
 
@@ -224,6 +225,11 @@ def _draw_overlay(fig, a0, a1, cloud, arc, tpk, cloud_label="full-model sweep",
                edgecolor="k", linewidth=0.4, zorder=7)
     hh = [Line2D([], [], color=plt.get_cmap(FT_CMAP)(0.5), marker="o", ls="-", lw=1.8, mec="k",
                  mew=0.4, label=f"DSIVC Pareto (P95 + min–max, n={len(af)})")]
+    if new_pts is not None and len(new_pts):
+        a0.scatter(new_pts["cost"], new_pts["peak_so4"], marker="*", s=130, c="red",
+                   edgecolor="k", linewidth=0.5, zorder=9)
+        hh.append(Line2D([], [], color="red", marker="*", ls="none", mec="k", mew=0.5,
+                         label=f"new FOM samples (n={len(new_pts)})"))
     if tpk is not None:
         a0.axhline(tpk, color=ROLE["truth"], ls="--", lw=1.4)
         hh.append(Line2D([], [], color=ROLE["truth"], ls="--", lw=1.4, label=f"truth ({tpk:.0f})"))
@@ -243,6 +249,11 @@ def _draw_overlay(fig, a0, a1, cloud, arc, tpk, cloud_label="full-model sweep",
     hh1 = [Line2D([], [], color="0.7", marker="o", ls="none", label=cloud_label),
            Line2D([], [], color=plt.get_cmap(FT_CMAP)(0.5), marker="o", ls="none", mec="k", mew=0.4,
                   label="DSIVC stack (mean, min–max)")]
+    if new_pts is not None and len(new_pts):
+        a1.scatter(new_pts["f_treat"], new_pts["peak_so4"], marker="*", s=130, c="red",
+                   edgecolor="k", linewidth=0.5, zorder=9)
+        hh1.append(Line2D([], [], color="red", marker="*", ls="none", mec="k", mew=0.5,
+                          label=f"new FOM samples (n={len(new_pts)})"))
     if tpk is not None:
         a1.axhline(tpk, color=ROLE["truth"], ls="--", lw=1.4)
         hh1.append(Line2D([], [], color=ROLE["truth"], ls="--", lw=1.4, label=f"truth ({tpk:.0f})"))
@@ -299,8 +310,9 @@ def _infer_k_cost(arc):
 
 
 def load_loop_cloud(iter_dir, k_cost):
-    """The accumulated FOM ground-truth cloud saved per iteration (f_treat + peak recovered-SO4);
-    cost is reconstructed from f_treat (deterministic) so panel (a) can place it."""
+    """The accumulated FOM ground-truth cloud saved per iteration (f_treat + peak recovered-SO4), index
+    preserved (s* = base sweep, i{k}r* = iteration-k infill); cost is reconstructed from f_treat
+    (deterministic) so panel (a) can place it."""
     df = pd.read_csv(Path(iter_dir) / "train_fom_cloud.csv", index_col=0)
     cl = df.rename(columns={"fore_peak_so4": "peak_so4"})[["f_treat", "peak_so4"]].copy()
     cl["cost"] = k_cost * -np.log(np.clip(1.0 - cl["f_treat"], 1e-9, None))
@@ -319,24 +331,38 @@ def loop_front(iter_dir, gen=None):
     return _nondominated(pop[pop["gen"] <= gen], "cost", P95), f"gen{gen}"
 
 
-def fig_loop_frame(iter_dir, gen=None, frame_idx=None, ylim=None, xlim_cost=None):
-    """One movement-GIF frame: the accumulated FOM cloud (backdrop) + the DSIVC Pareto front at a given
-    generation (cumulative non-dominated up to `gen`; None = final archive), same layout as
-    sweep_vs_dsivc, tagged iter/gen. Pass ylim/xlim_cost to freeze axes across the animation."""
+def fig_loop_frame(iter_dir, gen=None, frame_idx=None, phase="front", ylim=None, xlim_cost=None):
+    """One movement-GIF frame. Two phases:
+      * phase='front'   -- the DSIVC Pareto front at generation `gen` (cumulative non-dominated up to
+        `gen`; None = final archive) against the FOM cloud it was TRAINED on (accumulated FOM minus THIS
+        iteration's own infill);
+      * phase='samples' -- the same final front + the NEW FOM sample points this iteration added,
+        highlighted as red stars (the state just before the next DSIVC retrain).
+    Pass ylim/xlim_cost to freeze axes across the animation."""
     apply_style()
     iter_dir = Path(iter_dir)
-    arc, gtag = loop_front(iter_dir, gen)
+    it_num = int(iter_dir.name.replace("iter", ""))
+    arc, gtag = loop_front(iter_dir, None if phase == "samples" else gen)
     _check_stack(arc, f"{iter_dir} {gtag}")
     k = _infer_k_cost(arc)
     cloud = load_loop_cloud(iter_dir, k)
+    is_new = cloud.index.astype(str).str.startswith(f"i{it_num}r")   # this iter's infill points
+    prior, new = cloud[~is_new], cloud[is_new]
     tpk = _truth_peak(str(iter_dir / "master")) or _truth_peak(str(iter_dir.parent))
-    it_num = int(iter_dir.name.replace("iter", ""))
+
     fig, (a0, a1) = plt.subplots(1, 2, figsize=(13, 5.2))
-    _draw_overlay(fig, a0, a1, cloud, arc, tpk, cloud_label=f"FOM cloud (n={len(cloud)})",
-                  ylim=ylim, xlim_cost=xlim_cost)
-    fig.suptitle(f"Outer loop — iter {it_num}, {gtag}: DSIVC front vs accumulated FOM cloud "
-                 f"(train n={len(cloud)})", fontweight="bold")
-    name = f"frame_{frame_idx:03d}" if frame_idx is not None else f"loop_iter{it_num:02d}_{gtag}"
+    if phase == "samples":
+        _draw_overlay(fig, a0, a1, prior, arc, tpk, cloud_label=f"FOM cloud (n={len(prior)})",
+                      new_pts=new, ylim=ylim, xlim_cost=xlim_cost)
+        fig.suptitle(f"Outer loop — iter {it_num}: {len(new)} NEW FOM samples added at the Pareto picks "
+                     f"→ retrain (train n={len(cloud)})", fontweight="bold")
+        name = f"frame_{frame_idx:03d}" if frame_idx is not None else f"loop_iter{it_num:02d}_samples"
+    else:
+        _draw_overlay(fig, a0, a1, prior, arc, tpk, cloud_label=f"FOM cloud (n={len(prior)})",
+                      ylim=ylim, xlim_cost=xlim_cost)
+        fig.suptitle(f"Outer loop — iter {it_num}, {gtag}: DSIVC front vs FOM training cloud "
+                     f"(n={len(prior)})", fontweight="bold")
+        name = f"frame_{frame_idx:03d}" if frame_idx is not None else f"loop_iter{it_num:02d}_{gtag}"
     return savefig(fig, name, f"{STAGE}/frames")
 
 
@@ -346,9 +372,11 @@ def render_loop_frames(loop_dir=None, per_gen=True, freeze_axes=True):
     not the axes. Returns the ordered list of frame paths; prints the ffmpeg/ImageMagick assembly line."""
     base = Path(__file__).parent
     loop_dir = Path(loop_dir or base / "_s7_loop")
-    iters = sorted(p for p in loop_dir.glob("iter*") if (p / "master").exists())
+    # only COMPLETED iterations (train_fom_cloud.csv is written at the end of each) -- skip an in-progress one
+    iters = sorted(p for p in loop_dir.glob("iter*")
+                   if (p / "master").exists() and (p / "train_fom_cloud.csv").exists())
     if not iters:
-        raise FileNotFoundError(f"no iterNN/master under {loop_dir}")
+        raise FileNotFoundError(f"no completed iterNN/ under {loop_dir}")
     # sweep all fronts once to fix common axes
     ylim = xlim = None
     if freeze_axes:
@@ -373,10 +401,19 @@ def render_loop_frames(loop_dir=None, per_gen=True, freeze_axes=True):
             gens = [None]
         for g in gens:
             try:
-                frames.append(fig_loop_frame(it, gen=g, frame_idx=idx, ylim=ylim, xlim_cost=xlim))
+                frames.append(fig_loop_frame(it, gen=g, frame_idx=idx, phase="front",
+                                             ylim=ylim, xlim_cost=xlim))
                 idx += 1
             except (FileNotFoundError, KeyError) as e:
                 print(f"  [frames] skip {it.name} gen={g}: {e}")
+        # after the front converges, a frame highlighting the NEW FOM samples (before the next retrain)
+        if (it / "train_fom_cloud.csv").exists():
+            try:
+                frames.append(fig_loop_frame(it, frame_idx=idx, phase="samples",
+                                             ylim=ylim, xlim_cost=xlim))
+                idx += 1
+            except (FileNotFoundError, KeyError) as e:
+                print(f"  [frames] skip {it.name} samples: {e}")
     fdir = frames[0].parent if frames else base / "_figs" / STAGE / "frames"
     if frames:
         try:
