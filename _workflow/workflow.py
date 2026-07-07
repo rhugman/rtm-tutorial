@@ -3155,6 +3155,7 @@ WS7_DSIVC = Path(__file__).parent / "_s7_dsivc_template"      # runstore DSI + D
 WS7_DSIVC_MASTER = Path(__file__).parent / "_s7_dsivc_master"
 _S7_DSIVC_WORKER_ROOT = Path(__file__).parent / "_s7_dsivc_workers"
 WS7_DSIVC_RUNSTORE = Path(__file__).parent / "_s7_dsivc_runstore"   # runstore DSI (dsi_t_d for DSIVC)
+WS7_LOOP = Path(__file__).parent / "_s7_loop"                # outer-loop per-iteration outputs (GIF frames)
 N_SWEEP = N_PRIOR_MC                                          # paired with the prior MC -- MUST match
 
 
@@ -3294,8 +3295,10 @@ def build_dsivc(merged=None, dsivc_template=WS7_DSIVC, runstore=WS7_DSIVC_RUNSTO
         if not keep_reals:
             raise RuntimeError("training='sweep' but no s* reals in the merged set")
         merged = merged.loc[keep_reals]
+    elif training == "asis":
+        pass                                  # outer loop passes a pre-assembled sweep+infill set verbatim
     elif training != "merged":
-        raise ValueError(f"training must be 'sweep' or 'merged', got {training!r}")
+        raise ValueError(f"training must be 'sweep', 'merged' or 'asis', got {training!r}")
     print(f"  [build_dsivc] training set = {training} ({merged.shape[0]} reals); "
           f"corr(f_treat, peak-SO4) = {np.corrcoef(merged['f_treat'].values.astype(float), merged['fore_peak_so4'].values.astype(float))[0,1]:+.3f}")
 
@@ -3459,6 +3462,166 @@ def infill_ftreat(archive_ft, train_ft=None, n_f=8, prev_res=None, alpha=0.6, be
     return np.interp(q, cdf, grid)
 
 
+def _fom_training_rows(master_dir, sweep_template=WS7_SWEEP, s3_template=WS3, index_prefix="i"):
+    """One FOM obs jcb (the base sweep or an infill wave) -> a DSI training-row DataFrame with the SAME
+    columns merge_training_data produces: the DSI keep-obs (from the Section-3 pst) + f_treat (echoed,
+    from the sweep pst) + derived fore_peak_so4."""
+    import pyemu
+    pst_sw = pyemu.Pst(str(Path(sweep_template) / "pest.pst"))
+    pst_sw.try_parse_name_metadata()
+    pst_s3 = pyemu.Pst(str(Path(s3_template) / "pest.pst"))
+    oe = pyemu.ObservationEnsemble.from_binary(pst=pst_sw, filename=str(Path(master_dir) / "pest.0.obs.jcb"))
+    df = pd.DataFrame(oe.values, index=oe.index.astype(str), columns=[c.lower() for c in oe.columns])
+    keep = [c.lower() for c in _dsi_keepobs(pst_s3)]                 # weighted + forecast, shared by both
+    fore = [c for c in keep if pst_s3.observation_data.loc[c, "obgnme"] == "forecast"]
+    ft = [o.lower() for o in pst_sw.observation_data.index
+          if pst_sw.observation_data.loc[o, "obgnme"] == "ftreat"][0]
+    out = df.loc[:, keep + ([ft] if ft not in keep else [])].astype(float)
+    if ft != "f_treat":
+        out = out.rename(columns={ft: "f_treat"})
+    out["fore_peak_so4"] = out.loc[:, fore].max(axis=1)
+    out.index = [f"{index_prefix}{i}" for i in range(out.shape[0])]
+    return out, fore
+
+
+def build_infill_par_ensemble(locs, K, iter_k, out_path, prior_pe_path=WS3 / "prior_pe.jcb",
+                              sweep_template=WS7_SWEEP, s3_template=WS3, seed=20260707):
+    """Paired-CRN infill par ensemble: draw ONE random K-subset of prior_pe (rotated by iter_k so the
+    whole ensemble is covered over the loop) and replicate it across the f_treat locations, injecting
+    each loc -> (len(locs)*K) reals. Same params at every loc = common random numbers = a clean
+    f_treat-response per realization (minimum-variance cov(f_treat, forecast) for the DSI)."""
+    import pyemu
+    pst_s3 = pyemu.Pst(str(Path(s3_template) / "pest.pst"))
+    pst_sw = pyemu.Pst(str(Path(sweep_template) / "pest.pst"))
+    base = pyemu.ParameterEnsemble.from_binary(pst=pst_s3, filename=str(prior_pe_path))._df
+    rng = np.random.default_rng(seed + iter_k)
+    idx = rng.choice(np.asarray(base.index), size=min(K, base.shape[0]), replace=False)
+    sub = base.loc[idx]
+    rows = []
+    for j, f in enumerate(locs):
+        r = sub.copy()
+        r["f_treat"] = float(f)
+        r.index = [f"it{iter_k}_l{j}_r{ri}" for ri in range(sub.shape[0])]
+        rows.append(r)
+    df = pd.concat(rows, axis=0).loc[:, list(pst_sw.par_names)]
+    pe = pyemu.ParameterEnsemble(pst=pst_sw, df=df)
+    pe.enforce()
+    pe.to_binary(str(out_path))
+    print(f"  [infill_pe] iter {iter_k}: {len(locs)} locs x {sub.shape[0]} params = {pe.shape[0]} reals -> {Path(out_path).name}")
+    return pe
+
+
+def run_fom_infill(pe_path, master_dir, num_workers, template_ws=WS7_SWEEP, condor_kwargs=None):
+    """Run one FOM infill wave: the paired-CRN ensemble through the SAME with_treatment sweep interface
+    (pestpp-ies noptmax=-1), deployed to condor/local like run_dsivc_sweep. Writes to master_dir."""
+    import pyemu
+    template_ws, master_dir = Path(template_ws), Path(master_dir)
+    pe_name = Path(pe_path).name
+    if Path(pe_path).resolve() != (template_ws / pe_name).resolve():
+        shutil.copy(str(pe_path), str(template_ws / pe_name))
+    pst = pyemu.Pst(str(template_ws / "pest.pst"))
+    n = pyemu.ParameterEnsemble.from_binary(pst=pst, filename=str(template_ws / pe_name)).shape[0]
+    pst.pestpp_options["ies_par_en"] = pe_name
+    pst.pestpp_options["ies_num_reals"] = n
+    pst.pestpp_options["ies_no_noise"] = True
+    pst.pestpp_options["save_binary"] = True
+    pst.control_data.noptmax = -1
+    pst.write(str(template_ws / "pest.pst"), version=2)
+    _slim_template(template_ws)
+    return _deploy_pestpp(template_ws, "pest.pst", master_dir, num_workers, _S7_WORKER_ROOT,
+                          condor_kwargs=condor_kwargs)
+
+
+def _front_shift(arc, arc_prev, p95_col, npts=50):
+    """Max |dP95| between two Pareto fronts over their overlapping cost range (mg/L) -- convergence gauge."""
+    if arc_prev is None or arc is None or not len(arc) or not len(arc_prev):
+        return None
+    a, b = arc.sort_values("cost"), arc_prev.sort_values("cost")
+    lo, hi = max(a["cost"].min(), b["cost"].min()), min(a["cost"].max(), b["cost"].max())
+    if not (hi > lo):
+        return None
+    grid = np.linspace(lo, hi, npts)
+    return float(np.max(np.abs(np.interp(grid, a["cost"], a[p95_col]) - np.interp(grid, b["cost"], b[p95_col]))))
+
+
+def run_dsivc_outer_loop(n_iters=10, gens_per_iter=3, num_workers=None, condor_kwargs=None,
+                         alpha=0.6, beta=3.0, conv_tol=1.0, seed=20260707, loop_dir=WS7_LOOP):
+    """Iterative FOM-retrain outer loop (ADR-0003). Each iteration: run a short (gens_per_iter) MOU on
+    the current DSI, pick FOM infill f_treat over the Pareto footprint (infill_ftreat), run one
+    pool-filling FOM wave (paired-CRN params), append it to the training set, refit. EARLY-STOPS when
+    the Pareto front stops moving (max |dP95| at matched cost < conv_tol mg/L).
+
+    Every iteration's MOU master (ALL generations: dsivc.<g>.{dv,obs}_pop.csv + archive) and the
+    accumulated FOM cloud are preserved under loop_dir/iterNN/ so sweep_vs_dsivc frames can be rendered
+    per (iter, generation) for a movement GIF."""
+    import os
+    import plot_dsivc as _pl
+    loop_dir = Path(loop_dir)
+    loop_dir.mkdir(exist_ok=True)
+    if num_workers is None:
+        num_workers = CONDOR_DEFAULTS["n_workers"] if _htcondor_available() else max(1, (os.cpu_count() or 2) - 1)
+    n_f, K = _infill_grid_size(num_workers)
+    P95 = "fore_peak_so4_stat:95%"
+    print(f"[outer_loop] {n_iters} iters max, {gens_per_iter}-gen MOU each, wave = {n_f} f_treat x {K} params "
+          f"({n_f * K} FOM/iter), early-stop at front shift < {conv_tol} mg/L")
+
+    # base training = the sweep-only FOM set (ground truth backdrop, iteration -1)
+    train, _fore = _fom_training_rows(WS7_SWEEP_MASTER, index_prefix="s")
+    prev_locs, prev_p95_fom, prev_arc = None, None, None
+
+    for k in range(n_iters):
+        it = loop_dir / f"iter{k:02d}"
+        it.mkdir(exist_ok=True)
+        tdir, rstore, mdir = it / "dsivc_template", it / "runstore", it / "master"
+
+        # 1. build + short MOU on the current DSI (decvar-only conditioning, training as-is)
+        build_dsivc(train, dsivc_template=tdir, runstore=rstore, mou_gens=gens_per_iter, training="asis")
+        run_dsivc_mou(dsivc_template=tdir, master_dir=mdir, num_workers=num_workers, condor_kwargs=condor_kwargs)
+        arc, pop = _pl.load_archive(str(mdir)), _pl.load_population(str(mdir))
+
+        # 2. active-learning residual from the PREVIOUS wave's FOM truth (emulator P95 vs FOM P95 at locs)
+        prev_res, p95_emul = None, None
+        if prev_locs is not None and pop is not None and len(pop):
+            ps = pop.sort_values("f_treat")
+            p95_emul = np.interp(prev_locs, ps["f_treat"].values, ps[P95].values)
+            prev_res = (prev_locs, np.abs(p95_emul - prev_p95_fom))
+
+        # 3. pick infill f_treat locations
+        locs = infill_ftreat(arc["f_treat"].values, n_f=n_f, prev_res=prev_res, alpha=alpha, beta=beta)
+
+        # 4-5. paired-CRN FOM wave
+        pe_path = it / "infill_pe.jcb"
+        build_infill_par_ensemble(locs, K, k, pe_path, seed=seed)
+        run_fom_infill(pe_path, it / "infill_master", num_workers, condor_kwargs=condor_kwargs)
+
+        # 6. extract + accumulate; stash per-loc FOM P95 for the next residual
+        rows, _ = _fom_training_rows(it / "infill_master", index_prefix=f"i{k}r")
+        train = pd.concat([train, rows], axis=0)
+        p95_fom = np.array([np.percentile(rows.loc[np.isclose(rows["f_treat"].values, f, atol=2e-3),
+                                                   "fore_peak_so4"].values, 95)
+                            if np.isclose(rows["f_treat"].values, f, atol=2e-3).any() else np.nan
+                            for f in locs])
+
+        # preserve GIF backdrop + infill bookkeeping
+        train[["f_treat", "fore_peak_so4"]].to_csv(it / "train_fom_cloud.csv")
+        pd.DataFrame({"loc": locs, "p95_fom": p95_fom,
+                      "p95_emul_prev": (p95_emul if p95_emul is not None else np.full(len(locs), np.nan))
+                      }).to_csv(it / "infill_meta.csv", index=False)
+
+        # 7. convergence on the Pareto front
+        shift = _front_shift(arc, prev_arc, P95)
+        print(f"  [outer_loop] iter {k}: n_train={train.shape[0]}, archive n={0 if arc is None else len(arc)}, "
+              f"front_shift={'n/a' if shift is None else f'{shift:.2f} mg/L'}")
+        prev_locs, prev_p95_fom, prev_arc = locs, p95_fom, arc
+        if shift is not None and shift < conv_tol:
+            print(f"  [outer_loop] CONVERGED (front shift {shift:.2f} < {conv_tol} mg/L) at iter {k}")
+            break
+
+    train.to_csv(loop_dir / "train_final.csv")
+    print(f"[outer_loop] done: {train.shape[0]} training reals, {k + 1} iterations under {loop_dir}")
+    return train, prev_arc
+
+
 def stage7_dsivc(num_workers=None, condor_kwargs=None):
     """Section-7 orchestrator (draft): build sweep interface -> reuse-120 sweep ensemble -> run sweep ->
     merge with the prior MC -> build DSIVC. Requires the Section-5 prior MC (_s5_master) already landed.
@@ -3533,6 +3696,12 @@ if __name__ == "__main__":
                     training="merged" if "--merged" in sys.argv else "sweep")
     elif "--stage7mou" in sys.argv:                          # deploy the DSIVC pestpp-mou run only
         run_dsivc_mou()
+    elif "--stage7loop" in sys.argv:                         # iterative FOM-retrain outer loop (n_iters=10)
+        _ni = 10
+        for a in sys.argv:
+            if a.startswith("--iters="):
+                _ni = int(a.split("=")[1])
+        run_dsivc_outer_loop(n_iters=_ni)
     elif "--stage7" in sys.argv:
         stage7_dsivc()
     elif "--reinflate" in sys.argv:                          # test reinflation on failed LOO xvals
