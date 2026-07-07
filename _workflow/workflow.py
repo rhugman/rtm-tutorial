@@ -1360,6 +1360,28 @@ def _add_array_prop(pf, ib, gs, tag, ws, bounds, base_fn, ult=None, second="cons
     return files
 
 
+def _inject_forward_run_log(fr_path):
+    """Redirect the generated forward_run.py's stdout+stderr (fd 1 & 2) to ``forward_run.log`` so the
+    ENTIRE forward run -- every pre-command print, the model output, and any uncaught traceback -- is
+    captured on the worker, even when it dies in a pre-command before mf6rtm/mfsim.lst exist. The block
+    is inserted right before the first ``def`` (after the imports, so ``os`` is available; before main()
+    runs). os.dup2 on the file descriptors catches subprocess output too. Idempotent."""
+    import re
+    fr_path = Path(fr_path)
+    txt = fr_path.read_text()
+    if "forward_run.log" in txt:
+        return
+    block = (
+        "\n# --- capture the whole forward run for panther_transfer_on_fail (injected by build_pest_interface) ---\n"
+        "import os as _os\n"
+        "_os.dup2(_os.open('forward_run.log', _os.O_WRONLY | _os.O_CREAT | _os.O_TRUNC, 0o644), 1)\n"
+        "_os.dup2(1, 2)\n\n"
+    )
+    m = re.search(r"^def ", txt, flags=re.M)
+    if m:
+        fr_path.write_text(txt[:m.start()] + block + txt[m.start():])
+
+
 def build_pest_interface(model_ws=WS, template_ws=WS3, num_reals=N_REALS, with_treatment=False):
     """Section 3: build the PstFrom PEST interface over the two-well model.
 
@@ -1464,6 +1486,13 @@ def build_pest_interface(model_ws=WS, template_ws=WS3, num_reals=N_REALS, with_t
 
     pst = pf.build_pst(str(template_ws / "pest.pst"), version=2)
 
+    # --- capture the ENTIRE forward run to forward_run.log ----------------------------------
+    # The workers can die in a PRE-command (before mf6rtm/mfsim.lst even exist), so per-file capture
+    # isn't enough. Redirect the generated forward_run.py's fd 1+2 to forward_run.log at module load
+    # (right after its imports, before main()), so every pre-cmd print, the model output, and any
+    # uncaught traceback land in one file that panther_transfer_on_fail ships back on failure.
+    _inject_forward_run_log(template_ws / "forward_run.py")
+
     # --- pyrite reaction rate: single global hand-templated par -----------------------------
     _add_pyrite_rate_par(pst, template_ws)
 
@@ -1479,7 +1508,7 @@ def build_pest_interface(model_ws=WS, template_ws=WS3, num_reals=N_REALS, with_t
     pst.pestpp_options["ies_num_reals"] = num_reals
     # PANTHER: on a FAILED run, ship these diagnostic files from the worker back to the master so a
     # remote/worker crash (e.g. the mf6rtm OMP abort) can be inspected without shell access to the slot.
-    pst.pestpp_options["panther_transfer_on_fail"] = "mf6rtm.stdout,mfsim.lst,gwf.lst"
+    pst.pestpp_options["panther_transfer_on_fail"] = "forward_run.log,mf6rtm.stdout,mfsim.lst,gwf.lst"
     pst.control_data.noptmax = 0
     pst.write(str(template_ws / "pest.pst"), version=2)
     return pf, pst
