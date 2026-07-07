@@ -380,6 +380,20 @@ template before every worker run (now called inside run_prior_mc + run_dsivc_swe
 the whole arc is robust without the manual slim step. "No stops": fig errors are caught+skipped; QA gates
 still fail-fast on genuine errors.
 
+## Production: individual --stageN flags now match --all (user 2026-07-07)
+Each CLI stage flag calls exactly what run_all does. Fixes:
+- N_PRIOR_MC = 120 (new constant): production prior-MC ensemble size. Drives stage5 default (was
+  num_reals or num_workers ~ 15 -- WRONG), N_SWEEP (=N_PRIOR_MC, paired), and run_all. N_REALS=201 is now
+  just the interface-build placeholder (overridden at run time). All three (prior MC / sweep / FOM-reuse)
+  must match -> one constant.
+- --stage6 now = regen_figs() (DSI condition on the LOCKED truth + all figs), NOT the old
+  build_dsi_conditioning(truth_real="5") quick summary.
+- --stage2 (default/else) now build + RUN the model (run_model=True), as run_all does.
+- stage7_dsivc num_workers default None -> resolves to CONDOR_DEFAULTS(60)/cpu-1 like stage6_fom; run_all
+  passes None. All stage orchestrators now resolve workers the same way.
+Verified: N_PRIOR_MC=N_SWEEP=120, stage5 ->120 reals, --stage6->regen_figs, --stage2 runs model, run_all
+num_reals=120. Bump the production count in ONE place (N_PRIOR_MC) if scaling up.
+
 ## SECTION 7 -- DSIVC optimization (DESIGN LOCKED 2026-07-06, not yet built)
 
 Framing: ADR-0003 f_treat lever (SUPERSEDES the old three-well dv-rate design in memory dsivc-part1-08).

@@ -1330,7 +1330,9 @@ WS3 = Path(__file__).parent / "_s3_template"       # PEST template (mothership, 
 _S3_STAGE = Path(__file__).parent / "_s3_stage"    # staged copy of _s2_model PstFrom wraps
 PP_SPACE = 10.0            # pilot-point spacing (m)
 VARIO_RANGE = 100.0       # spherical variogram range (m), isotropic
-N_REALS = 201             # prior ensemble size
+N_REALS = 201             # PstFrom interface build placeholder for ies_num_reals (overridden at run time)
+N_PRIOR_MC = 120          # PRODUCTION prior-MC ensemble size -- drives stage5, the paired sweep, and run_all
+                          # (the DSI trains on it and the FOM/sweep reuse it, so all three must match)
 
 
 def _add_array_prop(pf, ib, gs, tag, ws, bounds, base_fn, ult=None, second="constant",
@@ -2165,7 +2167,7 @@ def stage5_prior_mc(num_reals=None, num_workers=None, condor_kwargs=None):
     import os
     apply_style()
     nw = num_workers or (os.cpu_count() - 1)
-    nr = num_reals or nw
+    nr = num_reals if num_reals is not None else N_PRIOR_MC   # production default (not the worker count)
     print(f"[stage5_prior_mc] num_reals={nr} num_workers={nw}")
     pf, pst = build_pest_interface()                    # rebuild to obtain pf for the draw
     draw_prior_ensemble(pf, nr)
@@ -3152,7 +3154,7 @@ _S7_WORKER_ROOT = Path(__file__).parent / "_s7_workers"
 WS7_DSIVC = Path(__file__).parent / "_s7_dsivc_template"      # runstore DSI + DSIVC (mou) template
 WS7_DSIVC_MASTER = Path(__file__).parent / "_s7_dsivc_master"
 _S7_DSIVC_WORKER_ROOT = Path(__file__).parent / "_s7_dsivc_workers"
-N_SWEEP = 120                                                 # match the Section-5 prior MC (paired)
+N_SWEEP = N_PRIOR_MC                                          # paired with the prior MC -- MUST match
 
 
 def build_sweep_interface(model_ws=WS, template_ws=WS7_SWEEP, num_reals=N_SWEEP):
@@ -3310,10 +3312,14 @@ def run_dsivc_mou(dsivc_template=WS7_DSIVC, master_dir=WS7_DSIVC_MASTER, num_wor
                           condor_kwargs=condor_kwargs, pestpp_exe="pestpp-mou")
 
 
-def stage7_dsivc(num_workers=15, condor_kwargs=None):
+def stage7_dsivc(num_workers=None, condor_kwargs=None):
     """Section-7 orchestrator (draft): build sweep interface -> reuse-120 sweep ensemble -> run sweep ->
-    merge with the prior MC -> build DSIVC. Requires the Section-5 prior MC (_s5_master) already landed."""
+    merge with the prior MC -> build DSIVC. Requires the Section-5 prior MC (_s5_master) already landed.
+    Worker count defaults to CONDOR_DEFAULTS (60) on a pool, else cpu_count-1 (same rule as stage6_fom)."""
+    import os
     apply_style()
+    if num_workers is None:
+        num_workers = CONDOR_DEFAULTS["n_workers"] if _htcondor_available() else max(1, (os.cpu_count() or 2) - 1)
     _pf, sweep_pst = build_sweep_interface()
     draw_sweep_ensemble(sweep_pst)
     run_dsivc_sweep(num_workers=num_workers, condor_kwargs=condor_kwargs)
@@ -3321,7 +3327,7 @@ def stage7_dsivc(num_workers=15, condor_kwargs=None):
     return build_dsivc(merged)
 
 
-def run_all(num_reals=120, num_workers=None, condor_kwargs=None, quantile=0.75):
+def run_all(num_reals=N_PRIOR_MC, num_workers=None, condor_kwargs=None, quantile=0.75):
     """ONE-SHOT DRIVER (``--all``): run the whole DIZON arc, stages 2 -> 7, in order, NO STOPS. Each
     stage writes the workspace the next consumes (mothership pattern). The heavy stages (prior MC,
     full-model IES history match, DSIVC sweep) auto-deploy to HTCondor when a pool is reachable, else
@@ -3347,7 +3353,7 @@ def run_all(num_reals=120, num_workers=None, condor_kwargs=None, quantile=0.75):
     _hdr("stage 6-FOM -- full-model IES history match (DSI gold-standard)")
     stage6_fom(num_workers=num_workers, condor_kwargs=condor_kwargs)
     _hdr("stage 7 -- DSIVC f_treat sweep + merge (240-real) + optimizer")
-    stage7_dsivc(num_workers=num_workers or 12, condor_kwargs=condor_kwargs)
+    stage7_dsivc(num_workers=num_workers, condor_kwargs=condor_kwargs)
     _hdr("DONE -- full DIZON arc complete")
 
 
@@ -3376,19 +3382,15 @@ if __name__ == "__main__":
         _fig_dsi_loo(_lx, _cv, _post)
         print(f"[stage6loo] LOO projection R={np.corrcoef(_lx.actual,_lx.emulated)[0,1]:.3f}; "
               f"LOO conditioning coverage={_cv.covered.mean():.0%}")
-    elif "--stage6" in sys.argv:
-        _dpst, _fore, _truth = build_dsi_conditioning()
-        run_dsi()
-        pr, po, tr = dsi_posterior(forecast_cols=_fore, truth=_truth)
-        print(f"[stage6] prior P50={np.percentile(pr,50):.1f} -> posterior P50={np.percentile(po,50):.1f} "
-              f"mg/L | truth {tr:.1f} | covered={np.percentile(po,5)<=tr<=np.percentile(po,95)}")
+    elif "--stage6" in sys.argv:                             # DSI condition on the LOCKED truth + all figs
+        regen_figs()                                         #   (same as run_all's stage 6, not truth_real=5)
     elif "--stage6fom" in sys.argv:                          # FULL-MODEL IES history match (DSI comparison)
         stage6_fom()
     elif "--stage5" in sys.argv:
-        stage5_prior_mc()
+        stage5_prior_mc()                                    # N_PRIOR_MC reals (same as run_all)
     elif "--stage4" in sys.argv:                             # lock truth + inject weights (after prior MC)
         stage4_truth_weights()
     elif "--stage3" in sys.argv:
         stage3_pstfrom()
-    else:
-        stage2_build(rebuild=_rebuild, run_model=_run)
+    else:                                                    # stage 2: build + RUN the model (as run_all does)
+        stage2_build(rebuild=_rebuild, run_model=True)
