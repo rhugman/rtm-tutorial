@@ -3532,6 +3532,41 @@ def run_fom_infill(pe_path, master_dir, num_workers, template_ws=WS7_SWEEP, cond
                           condor_kwargs=condor_kwargs)
 
 
+def seed_dvpop_from_archive(prev_master, dsivc_template, seed=0):
+    """WARM-START the next iteration's MOU: overwrite the freshly-drawn (random uniform) initial dv
+    population with the PREVIOUS iteration's Pareto-optimal decvars, so the optimizer refines the front
+    on the retrained emulator instead of re-exploring from scratch. Sized to mou_population_size: if the
+    archive has more members, take an even spread across the decvar range; if fewer, pad with uniform
+    draws for diversity."""
+    import pyemu
+    dsivc_template = Path(dsivc_template)
+    pst = pyemu.Pst(str(dsivc_template / "dsivc.pst"))
+    dv = pst.adj_par_names
+    mou_pop = int(pst.pestpp_options.get("mou_population_size", 2 * len(dv)))
+    arc = pd.read_csv(Path(prev_master) / "dsivc.archive.dv_pop.csv").set_index("real_name")
+    vals = np.sort(arc[dv].astype(float).values, axis=0) if len(dv) > 1 else \
+        np.sort(arc[dv[0]].astype(float).values)[:, None]
+    if vals.shape[0] >= mou_pop:                        # even spread across the (sorted) front
+        idx = np.linspace(0, vals.shape[0] - 1, mou_pop).round().astype(int)
+        seed_vals = vals[idx]
+    else:                                               # use all + pad with uniform draws to mou_pop
+        rng = np.random.default_rng(seed)
+        lo = pst.parameter_data.loc[dv, "parlbnd"].astype(float).values
+        hi = pst.parameter_data.loc[dv, "parubnd"].astype(float).values
+        pad = rng.uniform(lo, hi, size=(mou_pop - vals.shape[0], len(dv)))
+        seed_vals = np.vstack([vals, pad])
+    df = pd.DataFrame(seed_vals, columns=dv, index=[f"seed_{i}" for i in range(mou_pop)])
+    for p in pst.par_names:                             # carry any non-decvar pars at their control value
+        if p not in dv:
+            df[p] = float(pst.parameter_data.loc[p, "parval1"])
+    pe = pyemu.ParameterEnsemble(pst=pst, df=df.loc[:, list(pst.par_names)])
+    pe.enforce()
+    out = dsivc_template / pst.pestpp_options.get("mou_dv_population_file", "initial_dvpop.jcb")
+    pe.to_binary(str(out))
+    print(f"  [warm-start] seeded {mou_pop} initial decvars from {arc.shape[0]} Pareto members -> {out.name}")
+    return pe
+
+
 def _front_shift(arc, arc_prev, p95_col, npts=50):
     """Max |dP95| between two Pareto fronts over their overlapping cost range (mg/L) -- convergence gauge."""
     if arc_prev is None or arc is None or not len(arc) or not len(arc_prev):
@@ -3567,15 +3602,18 @@ def run_dsivc_outer_loop(n_iters=10, gens_per_iter=3, num_workers=None, condor_k
 
     # base training = the sweep-only FOM set (ground truth backdrop, iteration -1)
     train, _fore = _fom_training_rows(WS7_SWEEP_MASTER, index_prefix="s")
-    prev_locs, prev_p95_fom, prev_arc = None, None, None
+    prev_locs, prev_p95_fom, prev_arc, prev_master = None, None, None, None
 
     for k in range(n_iters):
         it = loop_dir / f"iter{k:02d}"
         it.mkdir(exist_ok=True)
         tdir, rstore, mdir = it / "dsivc_template", it / "runstore", it / "master"
 
-        # 1. build + short MOU on the current DSI (decvar-only conditioning, training as-is)
+        # 1. build + short MOU on the current DSI (decvar-only conditioning, training as-is).
+        #    WARM-START from iter k-1's Pareto front so the loop refines rather than re-explores.
         build_dsivc(train, dsivc_template=tdir, runstore=rstore, mou_gens=gens_per_iter, training="asis")
+        if prev_master is not None:
+            seed_dvpop_from_archive(prev_master, tdir, seed=seed + k)
         run_dsivc_mou(dsivc_template=tdir, master_dir=mdir, num_workers=num_workers, condor_kwargs=condor_kwargs)
         arc, pop = _pl.load_archive(str(mdir)), _pl.load_population(str(mdir))
 
@@ -3612,7 +3650,7 @@ def run_dsivc_outer_loop(n_iters=10, gens_per_iter=3, num_workers=None, condor_k
         shift = _front_shift(arc, prev_arc, P95)
         print(f"  [outer_loop] iter {k}: n_train={train.shape[0]}, archive n={0 if arc is None else len(arc)}, "
               f"front_shift={'n/a' if shift is None else f'{shift:.2f} mg/L'}")
-        prev_locs, prev_p95_fom, prev_arc = locs, p95_fom, arc
+        prev_locs, prev_p95_fom, prev_arc, prev_master = locs, p95_fom, arc, mdir
         if shift is not None and shift < conv_tol:
             print(f"  [outer_loop] CONVERGED (front shift {shift:.2f} < {conv_tol} mg/L) at iter {k}")
             break
