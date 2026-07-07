@@ -850,6 +850,16 @@ def _add_treatment_par(pst, template_ws):
         [0.0, 0.0, F_TREAT_BOUNDS[1], "decvar", "none"]
 
 
+def omp_env_guard(ws="."):
+    """FORWARD-RUN pre-command (self-contained, runs FIRST): set KMP_DUPLICATE_LIB_OK so the ``mf6rtm``
+    subprocess spawned later in the forward run survives the duplicate-libomp clash (OMP Error #15 --
+    numpy/PhreeqcRM each ship a libomp) whatever env launched the worker. os.environ set here is
+    inherited by the mf6rtm subprocess. Embedded into forward_run.py, which does NOT import workflow,
+    so the module-level guard in workflow.py cannot reach the worker -- this closes that gap."""
+    import os
+    os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
+
+
 def apply_well_rates(ws="."):
     """FORWARD-RUN pre-command: set transmissivity-weighted wellin/wellout rates from the
     (PstFrom-perturbed) K field.
@@ -1394,6 +1404,7 @@ def build_pest_interface(model_ws=WS, template_ws=WS3, num_reals=N_REALS, with_t
     for fn in ("tidy_array()", "get_input_filenames()", "extract_layer_number()",
                "node_to_layer_icell2d()", "time_interpolate()"):
         pf.add_py_function(hbd_py, fn, is_pre_cmd=None)            # helpers
+    pf.add_py_function(wf_py, "omp_env_guard()", is_pre_cmd=True)      # PRE (first): KMP guard for mf6rtm
     pf.add_py_function(wf_py, "apply_well_rates()", is_pre_cmd=True)   # PRE: K -> T-weighted rates
     if with_treatment:                                                # PRE: f_treat -> treated wellin aux + cost
         pf.add_py_function(wf_py, "apply_treatment_forward()", is_pre_cmd=True)
