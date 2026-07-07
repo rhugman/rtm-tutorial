@@ -202,8 +202,10 @@ def fig_sweep_vs_dsivc(sweep_master, sweep_template, dsivc_master):
     fig, (a0, a1) = plt.subplots(1, 2, figsize=(13, 5.2))
 
     # (a) cost vs SO4: ground-truth sweep cloud (faded) + the DSIVC Pareto front (P95) with min-max whiskers
-    a0.scatter(s["cost"], s["peak_so4"], c=s["f_treat"], cmap="viridis", s=28,
-               edgecolor="none", alpha=0.5, zorder=3)
+    sc = a0.scatter(s["cost"], s["peak_so4"], c=s["f_treat"], cmap="viridis", s=28,
+                    edgecolor="none", alpha=0.5, zorder=3)
+    cb = fig.colorbar(sc, ax=a0)
+    cb.set_label("$f_{treat}$ (sweep)")
     af = arc.sort_values("cost")
     a0.errorbar(af["cost"], af[P95], yerr=[(af[P95] - af[PMIN]).clip(lower=0),
                 (af[PMAX] - af[P95]).clip(lower=0)], fmt="none", ecolor=C["black"],
