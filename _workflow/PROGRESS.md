@@ -366,6 +366,18 @@ worker_chmod_exes. build_dsivc scaffold step (g) now points at run_dsivc_mou. NB
 nested pestpp-ies /e (emulator-only, light) -> CONDOR_DEFAULTS memory/disk are over-provisioned; override
 via condor_kwargs to pack more per node. Callers of the deploy helper renamed (5 sites).
 
+## --all one-shot driver (user 2026-07-07)
+run_all() (--all): runs the whole arc stages 2->7 in order, NO STOPS. Sequence: stage2_build(run_model) ->
+stage3_pstfrom -> stage5_prior_mc(120) -> stage4_truth_weights -> regen_figs (DSI condition+xval+figs) ->
+stage6_fom -> stage7_dsivc. Stage 4 (NEW stage4_truth_weights = prior_forecast -> pick_truth(P75) ->
+lock_truth -> inject_truth_and_weights + weights fig) is sequenced AFTER prior MC / BEFORE stage 6 (the
+ordering wrinkle that had no CLI flag). Heavy stages auto-deploy HTCondor/local. Command:
+  export PATH=<env>/bin:$PATH && python -u _workflow/workflow.py --all
+Also added --stage4. _slim_template(ws): drops regenerated outputs (sout.csv/*.ucn/*.hds/*.lst/cbb) from a
+template before every worker run (now called inside run_prior_mc + run_dsivc_sweep) -> disk headroom, so
+the whole arc is robust without the manual slim step. "No stops": fig errors are caught+skipped; QA gates
+still fail-fast on genuine errors.
+
 ## SECTION 7 -- DSIVC optimization (DESIGN LOCKED 2026-07-06, not yet built)
 
 Framing: ADR-0003 f_treat lever (SUPERSEDES the old three-well dv-rate design in memory dsivc-part1-08).

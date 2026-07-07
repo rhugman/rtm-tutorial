@@ -1664,6 +1664,18 @@ def _ensure_env_zip():
     return env_zip
 
 
+def _slim_template(ws):
+    """Delete regenerated model OUTPUTS from a template before a worker run -- workers recreate them,
+    so PANTHER/Condor copy a small template instead of the multi-GB reactive outputs (disk headroom).
+    Keeps every input (.txt/.tpl/.ins/.dat/.jcb/.csv-except-sout/.pst/.phqr + binaries)."""
+    ws = Path(ws)
+    for f in ("sout.csv", "gwf.cbb", "gwf.lst", "mfsim.lst"):
+        (ws / f).unlink(missing_ok=True)
+    for pat in ("*.ucn", "*.hds", "*.lst", "*.list"):
+        for p in ws.glob(pat):
+            p.unlink(missing_ok=True)
+
+
 def _deploy_pestpp(template_ws, pst_name, master_dir, num_workers, worker_root,
                    condor_kwargs=None, pestpp_exe="pestpp-ies"):
     """Run any pestpp-* ensemble over workers: HTCondor pool when available, else local PANTHER.
@@ -1721,6 +1733,7 @@ def run_prior_mc(template_ws=WS3, num_workers=15, master_dir=WS5_MASTER, num_rea
     pst.pestpp_options["save_binary"] = True           # write obs/par ensembles as .jcb
     pst.control_data.noptmax = -1                       # evaluate prior ensemble only, no update
     pst.write(str(template_ws / "pest.pst"), version=2)
+    _slim_template(template_ws)                          # drop regenerated outputs -> disk headroom
     return _deploy_pestpp(template_ws, "pest.pst", master_dir, num_workers, _S5_WORKER_ROOT,
                               condor_kwargs=condor_kwargs)
 
@@ -1834,6 +1847,25 @@ def inject_truth_and_weights(template_ws=WS3, truth_dir=None, sigma=None):
     obs.loc[mh, "weight"] = 1.0 / HEAD_SIGMA
     pst.write(str(template_ws / "pest.pst"), version=2)
     return pst
+
+
+def stage4_truth_weights(master_dir=WS5_MASTER, template_ws=WS3, quantile=0.75):
+    """Section-4 orchestrator: lock the synthetic truth (the realization nearest ``quantile`` of the
+    prior-MC recovered-SO4 forecast) as the measured data + inject proportional 1/sigma weights on the
+    conditioning obs, then emit the obs/weights figure. Runs AFTER the prior MC (needs its forecast) and
+    BEFORE stage 6 (the DSI keepobs + conditioning depend on these weights). Returns the truth name."""
+    apply_style()
+    peak, fore, times = prior_forecast(master_dir, template_ws)
+    tname, tpeak, q = pick_truth(peak, quantile=quantile)
+    lock_truth(tname, master_dir=master_dir, template_ws=template_ws)
+    pst = inject_truth_and_weights(template_ws)
+    try:
+        _fig_weights(pst)
+    except Exception as exc:                              # no-stops: a fig hiccup must not abort the arc
+        print(f"  [stage4] weights fig skipped: {exc}")
+    print(f"[stage4] truth=r{tname} peak={tpeak:.1f} (P{int(round(quantile * 100))}={q:.1f}) mg/L; "
+          f"weights on {int((pst.observation_data.weight.astype(float) > 0).sum())} conditioning obs")
+    return tname
 
 
 def qa_gate_weights(pst):
@@ -3102,6 +3134,7 @@ def run_dsivc_sweep(template_ws=WS7_SWEEP, num_workers=15, master_dir=WS7_SWEEP_
     pst.pestpp_options["save_binary"] = True
     pst.control_data.noptmax = -1
     pst.write(str(template_ws / "pest.pst"), version=2)
+    _slim_template(template_ws)                          # drop regenerated outputs -> disk headroom
     return _deploy_pestpp(template_ws, "pest.pst", master_dir, num_workers, _S7_WORKER_ROOT,
                               condor_kwargs=condor_kwargs)
 
@@ -3226,10 +3259,42 @@ def stage7_dsivc(num_workers=15, condor_kwargs=None):
     return build_dsivc(merged)
 
 
+def run_all(num_reals=120, num_workers=None, condor_kwargs=None, quantile=0.75):
+    """ONE-SHOT DRIVER (``--all``): run the whole DIZON arc, stages 2 -> 7, in order, NO STOPS. Each
+    stage writes the workspace the next consumes (mothership pattern). The heavy stages (prior MC,
+    full-model IES history match, DSIVC sweep) auto-deploy to HTCondor when a pool is reachable, else
+    to local PANTHER workers -- so this same command scales from a laptop to a cluster. End-to-end
+    locally is many hours of full-model runs; on a pool it is the intended way to deploy the workflow.
+
+    Stage 4 (lock truth + weights) is sequenced correctly here -- AFTER the prior MC (it needs the
+    prior forecast to pick the P-quantile truth) and BEFORE stage 6.
+    """
+    def _hdr(s):
+        print(f"\n{'=' * 72}\n[run_all] {s}\n{'=' * 72}", flush=True)
+
+    _hdr("stage 2 -- model build + baseline run")
+    stage2_build(run_model=True)
+    _hdr("stage 3 -- PstFrom PEST interface")
+    stage3_pstfrom()
+    _hdr(f"stage 5 -- prior Monte Carlo ({num_reals} reals)")
+    stage5_prior_mc(num_reals=num_reals, num_workers=num_workers, condor_kwargs=condor_kwargs)
+    _hdr("stage 4 -- lock synthetic truth + inject weights")
+    stage4_truth_weights(quantile=quantile)
+    _hdr("stage 6 -- DSI condition + cross-validation + signature figures")
+    regen_figs()
+    _hdr("stage 6-FOM -- full-model IES history match (DSI gold-standard)")
+    stage6_fom(num_workers=num_workers, condor_kwargs=condor_kwargs)
+    _hdr("stage 7 -- DSIVC f_treat sweep + merge (240-real) + optimizer")
+    stage7_dsivc(num_workers=num_workers or 12, condor_kwargs=condor_kwargs)
+    _hdr("DONE -- full DIZON arc complete")
+
+
 if __name__ == "__main__":
     _run = "--run" in sys.argv
     _rebuild = "--rebuild" in sys.argv
-    if "--stage7sweep" in sys.argv:                          # build + run the f_treat sweep only
+    if "--all" in sys.argv:                                  # one-shot: whole arc, stages 2->7, no stops
+        run_all()
+    elif "--stage7sweep" in sys.argv:                        # build + run the f_treat sweep only
         _pf, _spst = build_sweep_interface()
         draw_sweep_ensemble(_spst)
         run_dsivc_sweep()
@@ -3259,6 +3324,8 @@ if __name__ == "__main__":
         stage6_fom()
     elif "--stage5" in sys.argv:
         stage5_prior_mc()
+    elif "--stage4" in sys.argv:                             # lock truth + inject weights (after prior MC)
+        stage4_truth_weights()
     elif "--stage3" in sys.argv:
         stage3_pstfrom()
     else:
