@@ -2246,7 +2246,11 @@ def stage5_prior_mc(num_reals=None, num_workers=None, condor_kwargs=None):
 
 WS6_DSI = Path(__file__).parent / "_s6_dsi_template"
 DSI_ENERGY = 1.0                                  # SVD energy threshold (1.0 = full rank, no truncation)
-DSI_TRANSFORMS = [{"type": "normal_score", "quadratic_extrapolation": True}]
+# normal-score transform with CLAMP (not extrapolation): values outside the fitted range pin to the
+# boundary knot rather than following a quadratic tail. Quadratic extrapolation shot the back-transformed
+# forecast below zero (unphysical negative recovered-SO4) at extreme decvar combos; clamp bounds every
+# emulated obs to its observed min/max, so peak recovered-SO4 can never leave the physical range.
+DSI_TRANSFORMS = [{"type": "normal_score", "extrapolation": "clamp"}]
 
 
 def _dsi_keepobs(pst):
