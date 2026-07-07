@@ -1645,13 +1645,14 @@ def _htcondor_available():
 def _configure_condor():
     """One-time condor_deploy project defaults: the four vendored deps travel as editable installs,
     the model/pestpp binaries get +x on each slot, bulky run outputs are excluded from the worker zip,
-    and the pool is assumed LINUX. (Deployment also needs LINUX binaries in bin/linux -- open item.)"""
+    and the pool is macOS -- the template ships the committed bin/mac binaries + the conda-pack env is
+    built on the mac submit node, so slots must match (bin/linux is not populated)."""
     from condor_deploy import configure
     configure(
         worker_pip_editable=[str(DEPS / d) for d in ("flopy", "pyemu", "mf6rtm", "vorflow")],
-        worker_chmod_exes=["mf6", "pestpp-ies", "pestpp-mou", "libmf6.so", "mf6rtm", "gridgen"],
+        worker_chmod_exes=["mf6", "pestpp-ies", "pestpp-mou", "libmf6.dylib", "mf6rtm", "gridgen"],
         zip_exclude=["*.ucn", "*.hds", "*.cbb", "*.cbc", "sout.csv", "*.lst", "*.list"],
-        platform_requirements='( (OpSys == "LINUX") )',
+        platform_requirements='( (OpSys == "MacOS") )',
         worker_python_version="3.12",
     )
 

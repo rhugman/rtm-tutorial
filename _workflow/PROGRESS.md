@@ -338,9 +338,11 @@ as a zip, no shared FS). Wired so the expensive full-model ensembles auto-route:
 - _ensure_env_zip(): the worker-env conda-pack tarball auto-builds (--build-env) ONCE if absent and is
   reused if present (force_recreate=False; packages/editable deps from _configure_condor). Path =
   $CONDOR_ENV_ZIP or REPO/worker_env.tar.gz (gitignored). Explicit condor_kwargs['env_zip'] still wins.
-- OPEN for real deployment: LINUX pestpp/mf6 binaries in bin/linux (not yet populated); confirm
-  worker_env_packages cover the mf6rtm/PhreeqcRM stack (conda-pack solve). Needs conda/mamba+conda-pack
-  on the submit node for the auto-build.
+- POOL IS macOS (user 2026-07-07): platform_requirements='( (OpSys == "MacOS") )' (user confirmed the
+  slots advertise "MacOS", not the HTCondor-standard "OSX"); worker_chmod_exes uses libmf6.dylib (not .so).
+  Ships the committed bin/mac binaries + a mac conda-pack env, so slots must be Macs. bin/linux moot.
+- OPEN for real deployment: confirm worker_env_packages cover the mf6rtm/PhreeqcRM stack (conda-pack
+  solve); needs conda/mamba+conda-pack on the mac submit node for the auto-build.
 
 ## FOM-conditioning step (full-model IES; DSI gold-standard comparison) -- user 2026-07-07
 build_fom_conditioning (Section 6): clones WS3 -> _s6_fom_template (keeps _s3_template clean) and mirrors
