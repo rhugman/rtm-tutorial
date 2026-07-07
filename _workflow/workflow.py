@@ -3252,7 +3252,7 @@ def merge_training_data(prior_master=WS5_MASTER, prior_template=WS3,
 
 def build_dsivc(merged=None, dsivc_template=WS7_DSIVC, runstore=WS7_DSIVC_RUNSTORE, template_ws=WS3,
                 model_ws=WS, truth_dir=None, seed=20260706, so4_pct=0.95, inner_noptmax=3,
-                mou_pop=40, mou_gens=20, num_reals=300, cond_on_data=False):
+                mou_pop=40, mou_gens=20, num_reals=300, cond_on_data=False, training="sweep"):
     """DSIVC outer optimization over the merged-trained DSI emulator: minimize treatment COST vs
     minimize P<so4_pct> peak recovered-SO4, decision variable f_treat.
 
@@ -3283,7 +3283,23 @@ def build_dsivc(merged=None, dsivc_template=WS7_DSIVC, runstore=WS7_DSIVC_RUNSTO
     if merged is None:
         merged, _fore = merge_training_data()
 
-    # (a) DSI on the merged ensemble
+    # training set: 'sweep' (default) trains the DSI on the SWEEP half only. That half varies f_treat on
+    # one consistent model, so its joint corr(f_treat, peak-SO4) is the true leverage (-0.577). The prior
+    # half sits ENTIRELY at f_treat=0 with a different SO4 baseline, so merging drags the f_treat=0 cluster
+    # down and flips the joint covariance POSITIVE (+0.19) -> the decvar-only conditioning then moves SO4
+    # the WRONG way (up with treatment). 'merged' keeps both halves (only sensible with cond_on_data, where
+    # the prior half adds history-matching content). See PROGRESS.md for the prior-vs-sweep f_treat=0 gap.
+    if training == "sweep":
+        keep_reals = [i for i in merged.index if str(i).startswith("s")]
+        if not keep_reals:
+            raise RuntimeError("training='sweep' but no s* reals in the merged set")
+        merged = merged.loc[keep_reals]
+    elif training != "merged":
+        raise ValueError(f"training must be 'sweep' or 'merged', got {training!r}")
+    print(f"  [build_dsivc] training set = {training} ({merged.shape[0]} reals); "
+          f"corr(f_treat, peak-SO4) = {np.corrcoef(merged['f_treat'].values.astype(float), merged['fore_peak_so4'].values.astype(float))[0,1]:+.3f}")
+
+    # (a) DSI on the (sweep-only by default) training ensemble
     dsi = DSI(data=merged, transforms=DSI_TRANSFORMS, energy_threshold=DSI_ENERGY).fit()
 
     # (b) runstore-prepare
@@ -3459,7 +3475,8 @@ if __name__ == "__main__":
         merge_training_data()
     elif "--stage7build" in sys.argv:                        # (re)build DSIVC only (reuse the landed sweep)
         _merged, _ = merge_training_data()
-        build_dsivc(_merged, cond_on_data="--cond-on-data" in sys.argv)
+        build_dsivc(_merged, cond_on_data="--cond-on-data" in sys.argv,
+                    training="merged" if "--merged" in sys.argv else "sweep")
     elif "--stage7mou" in sys.argv:                          # deploy the DSIVC pestpp-mou run only
         run_dsivc_mou()
     elif "--stage7" in sys.argv:
