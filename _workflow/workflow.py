@@ -3537,6 +3537,31 @@ def infill_ftreat(archive_ft, train_ft=None, n_f=8, prev_res=None, alpha=0.6, be
     return np.interp(q, cdf, grid)
 
 
+def infill_points(archive, decvars, n_f, obj_col="cost", prev_res=None, beta=3.0):
+    """Multi-decvar infill: select n_f Pareto-optimal decvar VECTORS to sample with the FOM, spread
+    evenly across the objective front (``obj_col``, e.g. cost -- which orders the trade-off). Returns an
+    (n_f x len(decvars)) DataFrame of full decvar combos (f_treat + per-screen toggles). With a single
+    decvar this reduces to the f_treat spread; with many it samples the decision-relevant front in the
+    FULL decvar space (the 1-D density sampler infill_ftreat does not generalise to N-D). Optional
+    active-learning: prev_res=(obj_locs, residual) biases the spread toward large emulator-vs-FOM error."""
+    arc = archive.dropna(subset=[obj_col]).sort_values(obj_col).reset_index(drop=True)
+    cols = [d for d in decvars if d in arc.columns]
+    n = len(arc)
+    if n <= n_f:
+        return arc.loc[:, cols].reset_index(drop=True)
+    if prev_res is not None and len(prev_res[0]) > 1:              # active-learning weighting over the front
+        rc, rv = np.asarray(prev_res[0], float), np.asarray(prev_res[1], float)
+        rv = rv / (rv.max() + 1e-12)
+        order = np.argsort(rc)
+        rhat = np.interp(arc[obj_col].values, rc[order], rv[order], left=rv[order][0], right=rv[order][-1])
+        w = 1.0 + beta * rhat
+        cdf = np.cumsum(w / w.sum())
+        idx = np.clip(np.searchsorted(cdf, (np.arange(n_f) + 0.5) / n_f), 0, n - 1)
+    else:                                                          # even spread across the front
+        idx = np.linspace(0, n - 1, n_f).round().astype(int)
+    return arc.iloc[idx].loc[:, cols].reset_index(drop=True)
+
+
 def _fom_training_rows(master_dir, sweep_template=WS7_SWEEP, s3_template=WS3, index_prefix="i"):
     """One FOM obs jcb (the base sweep or an infill wave) -> a DSI training-row DataFrame with the SAME
     columns merge_training_data produces: the DSI keep-obs (from the Section-3 pst) + f_treat (echoed,
@@ -3551,38 +3576,53 @@ def _fom_training_rows(master_dir, sweep_template=WS7_SWEEP, s3_template=WS3, in
     fore = [c for c in keep if pst_s3.observation_data.loc[c, "obgnme"] == "forecast"]
     ft = [o.lower() for o in pst_sw.observation_data.index
           if pst_sw.observation_data.loc[o, "obgnme"] == "ftreat"][0]
-    out = df.loc[:, keep + ([ft] if ft not in keep else [])].astype(float)
-    if ft != "f_treat":
-        out = out.rename(columns={ft: "f_treat"})
+    # per-screen decvars: echo obs (obgnme='screen') -> their decvar names (mirror merge_training_data)
+    screen_map = {}
+    for o in pst_sw.observation_data.index:
+        if pst_sw.observation_data.loc[o, "obgnme"] == "screen":
+            ol = o.lower()
+            hit = next((D for D in SCREEN_DVS if f"item:{D}".lower() in ol or ol.endswith(D.lower())), None)
+            if hit:
+                screen_map[ol] = hit
+    cols = keep + ([ft] if ft not in keep else []) + list(screen_map.keys())
+    out = df.loc[:, cols].astype(float).rename(columns={ft: "f_treat", **screen_map})
     out["fore_peak_so4"] = out.loc[:, fore].max(axis=1)
     out.index = [f"{index_prefix}{i}" for i in range(out.shape[0])]
     return out, fore
 
 
-def build_infill_par_ensemble(locs, K, iter_k, out_path, prior_pe_path=WS3 / "prior_pe.jcb",
+def build_infill_par_ensemble(dv_points, K, iter_k, out_path, prior_pe_path=WS3 / "prior_pe.jcb",
                               sweep_template=WS7_SWEEP, s3_template=WS3, seed=20260707):
     """Paired-CRN infill par ensemble: draw ONE random K-subset of prior_pe (rotated by iter_k so the
-    whole ensemble is covered over the loop) and replicate it across the f_treat locations, injecting
-    each loc -> (len(locs)*K) reals. Same params at every loc = common random numbers = a clean
-    f_treat-response per realization (minimum-variance cov(f_treat, forecast) for the DSI)."""
+    whole ensemble is covered over the loop) and replicate it across the infill DECVAR VECTORS, injecting
+    each vector -> (n_points*K) reals. Same params at every point = common random numbers = a clean
+    decvar-response per realization (minimum-variance cov(decvars, forecast) for the DSI).
+
+    ``dv_points`` : a DataFrame (n_points x n_decvars) of Pareto-optimal decvar combos (f_treat + any
+    per-screen toggles). Every listed decvar is injected per point; a scalar/array of f_treat is also
+    accepted (back-compat -> a single f_treat column)."""
     import pyemu
     pst_s3 = pyemu.Pst(str(Path(s3_template) / "pest.pst"))
     pst_sw = pyemu.Pst(str(Path(sweep_template) / "pest.pst"))
+    if not isinstance(dv_points, pd.DataFrame):                 # back-compat: a list/array of f_treat locs
+        dv_points = pd.DataFrame({"f_treat": np.asarray(dv_points, float)})
     base = pyemu.ParameterEnsemble.from_binary(pst=pst_s3, filename=str(prior_pe_path))._df
     rng = np.random.default_rng(seed + iter_k)
     idx = rng.choice(np.asarray(base.index), size=min(K, base.shape[0]), replace=False)
     sub = base.loc[idx]
     rows = []
-    for j, f in enumerate(locs):
+    for j, (_, dvrow) in enumerate(dv_points.reset_index(drop=True).iterrows()):
         r = sub.copy()
-        r["f_treat"] = float(f)
+        for dv, val in dvrow.items():                          # inject ALL decvars (f_treat + screens)
+            r[dv] = float(val)
         r.index = [f"it{iter_k}_l{j}_r{ri}" for ri in range(sub.shape[0])]
         rows.append(r)
     df = pd.concat(rows, axis=0).loc[:, list(pst_sw.par_names)]
     pe = pyemu.ParameterEnsemble(pst=pst_sw, df=df)
     pe.enforce()
     pe.to_binary(str(out_path))
-    print(f"  [infill_pe] iter {iter_k}: {len(locs)} locs x {sub.shape[0]} params = {pe.shape[0]} reals -> {Path(out_path).name}")
+    print(f"  [infill_pe] iter {iter_k}: {len(dv_points)} decvar points x {sub.shape[0]} params "
+          f"({', '.join(dv_points.columns)}) = {pe.shape[0]} reals -> {Path(out_path).name}")
     return pe
 
 
@@ -3657,9 +3697,10 @@ def _front_shift(arc, arc_prev, p95_col, npts=50):
 def run_dsivc_outer_loop(n_iters=10, gens_per_iter=3, num_workers=None, condor_kwargs=None,
                          alpha=0.6, beta=3.0, conv_tol=1.0, seed=20260707, loop_dir=WS7_LOOP):
     """Iterative FOM-retrain outer loop (ADR-0003). Each iteration: run a short (gens_per_iter) MOU on
-    the current DSI, pick FOM infill f_treat over the Pareto footprint (infill_ftreat), run one
-    pool-filling FOM wave (paired-CRN params), append it to the training set, refit. EARLY-STOPS when
-    the Pareto front stops moving (max |dP95| at matched cost < conv_tol mg/L).
+    the current DSI (WARM-STARTED from the previous Pareto front), pick n_f Pareto-optimal decvar vectors
+    spread across the cost front (infill_points -- generalises to the full f_treat + per-screen decvar
+    space), run one pool-filling paired-CRN FOM wave at those combos, append to the training set, refit.
+    EARLY-STOPS when the Pareto front stops moving (max |dP95| at matched cost < conv_tol mg/L).
 
     Every iteration's MOU master (ALL generations: dsivc.<g>.{dv,obs}_pop.csv + archive) and the
     accumulated FOM cloud are preserved under loop_dir/iterNN/ so sweep_vs_dsivc frames can be rendered
@@ -3672,12 +3713,12 @@ def run_dsivc_outer_loop(n_iters=10, gens_per_iter=3, num_workers=None, condor_k
         num_workers = CONDOR_DEFAULTS["n_workers"] if _htcondor_available() else max(1, (os.cpu_count() or 2) - 1)
     n_f, K = _infill_grid_size(num_workers)
     P95 = "fore_peak_so4_stat:95%"
-    print(f"[outer_loop] {n_iters} iters max, {gens_per_iter}-gen MOU each, wave = {n_f} f_treat x {K} params "
-          f"({n_f * K} FOM/iter), early-stop at front shift < {conv_tol} mg/L")
+    print(f"[outer_loop] {n_iters} iters max, {gens_per_iter}-gen MOU each, wave = {n_f} decvar points x {K} "
+          f"params ({n_f * K} FOM/iter), early-stop at front shift < {conv_tol} mg/L")
 
     # base training = the sweep-only FOM set (ground truth backdrop, iteration -1)
     train, _fore = _fom_training_rows(WS7_SWEEP_MASTER, index_prefix="s")
-    prev_locs, prev_p95_fom, prev_arc, prev_master = None, None, None, None
+    prev_arc, prev_master = None, None
 
     for k in range(n_iters):
         it = loop_dir / f"iter{k:02d}"
@@ -3690,42 +3731,34 @@ def run_dsivc_outer_loop(n_iters=10, gens_per_iter=3, num_workers=None, condor_k
         if prev_master is not None:
             seed_dvpop_from_archive(prev_master, tdir, seed=seed + k)
         run_dsivc_mou(dsivc_template=tdir, master_dir=mdir, num_workers=num_workers, condor_kwargs=condor_kwargs)
-        arc, pop = _pl.load_archive(str(mdir)), _pl.load_population(str(mdir))
+        arc = _pl.load_archive(str(mdir))
 
-        # 2. active-learning residual from the PREVIOUS wave's FOM truth (emulator P95 vs FOM P95 at locs)
-        prev_res, p95_emul = None, None
-        if prev_locs is not None and pop is not None and len(pop):
-            ps = pop.sort_values("f_treat")
-            p95_emul = np.interp(prev_locs, ps["f_treat"].values, ps[P95].values)
-            prev_res = (prev_locs, np.abs(p95_emul - prev_p95_fom))
+        # 2-3. infill: n_f Pareto-optimal DECVAR VECTORS (f_treat + screen toggles), spread across the
+        #      cost front. Read the full archive dv_pop (all decvars) + cost for the front ordering.
+        decvars = ["f_treat"] + [d for d in SCREEN_DVS if d in train.columns]
+        dvpop = pd.read_csv(mdir / "dsivc.archive.dv_pop.csv").set_index("real_name")
+        obpop = pd.read_csv(mdir / "dsivc.archive.obs_pop.csv").set_index("real_name")
+        front = dvpop.join(obpop["cost"])
+        dv_points = infill_points(front, decvars, n_f, obj_col="cost")
 
-        # 3. pick infill f_treat locations
-        locs = infill_ftreat(arc["f_treat"].values, n_f=n_f, prev_res=prev_res, alpha=alpha, beta=beta)
-
-        # 4-5. paired-CRN FOM wave
+        # 4-5. paired-CRN FOM wave at those decvar combos
         pe_path = it / "infill_pe.jcb"
-        build_infill_par_ensemble(locs, K, k, pe_path, seed=seed)
+        build_infill_par_ensemble(dv_points, K, k, pe_path, seed=seed)
         run_fom_infill(pe_path, it / "infill_master", num_workers, condor_kwargs=condor_kwargs)
 
-        # 6. extract + accumulate; stash per-loc FOM P95 for the next residual
+        # 6. extract + accumulate (rows carry f_treat + screen decvars + forecast)
         rows, _ = _fom_training_rows(it / "infill_master", index_prefix=f"i{k}r")
         train = pd.concat([train, rows], axis=0)
-        p95_fom = np.array([np.percentile(rows.loc[np.isclose(rows["f_treat"].values, f, atol=2e-3),
-                                                   "fore_peak_so4"].values, 95)
-                            if np.isclose(rows["f_treat"].values, f, atol=2e-3).any() else np.nan
-                            for f in locs])
 
         # preserve GIF backdrop + infill bookkeeping
         train[["f_treat", "fore_peak_so4"]].to_csv(it / "train_fom_cloud.csv")
-        pd.DataFrame({"loc": locs, "p95_fom": p95_fom,
-                      "p95_emul_prev": (p95_emul if p95_emul is not None else np.full(len(locs), np.nan))
-                      }).to_csv(it / "infill_meta.csv", index=False)
+        dv_points.to_csv(it / "infill_points.csv", index=False)
 
         # 7. convergence on the Pareto front
         shift = _front_shift(arc, prev_arc, P95)
         print(f"  [outer_loop] iter {k}: n_train={train.shape[0]}, archive n={0 if arc is None else len(arc)}, "
               f"front_shift={'n/a' if shift is None else f'{shift:.2f} mg/L'}")
-        prev_locs, prev_p95_fom, prev_arc, prev_master = locs, p95_fom, arc, mdir
+        prev_arc, prev_master = arc, mdir
         if shift is not None and shift < conv_tol:
             print(f"  [outer_loop] CONVERGED (front shift {shift:.2f} < {conv_tol} mg/L) at iter {k}")
             break
