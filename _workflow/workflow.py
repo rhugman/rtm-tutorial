@@ -3722,7 +3722,7 @@ def _front_shift(arc, arc_prev, p95_col, npts=50):
 
 def run_dsivc_outer_loop(n_iters=10, gens_per_iter=50, mou_pop=100, explore_frac=0.5,
                          num_workers=None, condor_kwargs=None, alpha=0.6, beta=3.0, conv_tol=1.0,
-                         seed=20260707, loop_dir=WS7_LOOP, cleanup=True, save_pop_every=10):
+                         seed=20260707, loop_dir=WS7_LOOP, cleanup=True, save_pop_every=10, resume=True):
     """Iterative FOM-retrain outer loop (ADR-0003). Each iteration: run a short (gens_per_iter) MOU on
     the current DSI (WARM-STARTED from the previous Pareto front), pick n_f Pareto-optimal decvar vectors
     spread across the cost front (infill_points -- generalises to the full f_treat + per-screen decvar
@@ -3734,7 +3734,11 @@ def run_dsivc_outer_loop(n_iters=10, gens_per_iter=50, mou_pop=100, explore_frac
     When cleanup=True the per-iter dead weight is deleted at the end of the iter -- the full 464k-obs FOM
     jcb (already thinned into infill_train.csv), the MOU template+runstore (binaries/pickle/noise), and
     the infill par ensemble -- so the loop's footprint stays ~one master per iteration, not GBs. The
-    accumulated FOM cloud + per-(iter,generation) frames are still renderable from what remains."""
+    accumulated FOM cloud + per-(iter,generation) frames are still renderable from what remains.
+
+    RESUME (default): a relaunch reloads each completed iteration's infill_train.csv + last archive and
+    continues at the first unfinished iteration, so killed/disk-capped runs pick up where they stopped
+    (CLI: --fresh forces a restart from iter 0). Requires the same sweep training set."""
     import os
     import plot_dsivc as _pl
     loop_dir = Path(loop_dir)
@@ -3749,8 +3753,27 @@ def run_dsivc_outer_loop(n_iters=10, gens_per_iter=50, mou_pop=100, explore_frac
     # base training = the sweep-only FOM set (ground truth backdrop, iteration -1)
     train, _fore = _fom_training_rows(WS7_SWEEP_MASTER, index_prefix="s")
     prev_arc, prev_master = None, None
+    start_k = 0
 
-    for k in range(n_iters):
+    # RESUME: reload each completed iteration's thinned infill rows (infill_train.csv, written before the
+    # cleanup) + the last archive/master, and continue at the first unfinished iteration. A completed iter
+    # has BOTH infill_train.csv and its MOU archive; anything short of that is redone.
+    if resume:
+        while True:
+            itd = loop_dir / f"iter{start_k:02d}"
+            if (itd / "infill_train.csv").exists() and (itd / "master" / "dsivc.archive.dv_pop.csv").exists():
+                train = pd.concat([train, pd.read_csv(itd / "infill_train.csv", index_col=0)], axis=0)
+                prev_master = itd / "master"
+                start_k += 1
+            else:
+                break
+        if start_k:
+            prev_arc = _pl.load_archive(str(prev_master))
+            print(f"[outer_loop] RESUME: {start_k} completed iters loaded (n_train={train.shape[0]}); "
+                  f"continuing at iter {start_k}")
+
+    k = start_k - 1                                     # keeps the final summary sane if nothing runs
+    for k in range(start_k, n_iters):
         it = loop_dir / f"iter{k:02d}"
         it.mkdir(exist_ok=True)
         tdir, rstore, mdir = it / "dsivc_template", it / "runstore", it / "master"
@@ -3894,7 +3917,8 @@ if __name__ == "__main__":
         for a in sys.argv:
             if a.startswith("--iters="):
                 _ni = int(a.split("=")[1])
-        run_dsivc_outer_loop(n_iters=_ni)
+        # resumes from completed iters by default; --fresh forces a restart from iter 0
+        run_dsivc_outer_loop(n_iters=_ni, resume="--fresh" not in sys.argv)
     elif "--stage7" in sys.argv:
         stage7_dsivc()
     elif "--reinflate" in sys.argv:                          # test reinflation on failed LOO xvals
