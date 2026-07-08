@@ -353,9 +353,20 @@ class CondorWorkerPool:
 
         r = subprocess.run(
             ["condor_submit", str(sub_path)],
-            capture_output=True, text=True, check=True,
+            capture_output=True, text=True,
             cwd=str(self._staging),
         )
+        if r.returncode != 0:
+            # surface condor's actual complaint (check=True would swallow it as a bare exit code)
+            log.error("condor_submit failed (exit %d) for %s", r.returncode, sub_path)
+            if r.stdout.strip():
+                log.error("condor_submit stdout:\n%s", r.stdout.strip())
+            if r.stderr.strip():
+                log.error("condor_submit stderr:\n%s", r.stderr.strip())
+            raise RuntimeError(
+                f"condor_submit failed (exit {r.returncode}): "
+                f"{(r.stderr.strip() or r.stdout.strip() or 'no output').splitlines()[-1]}\n"
+                f"submit file: {sub_path}")
         cluster_id = "unknown"
         for line in r.stdout.splitlines():
             if "cluster" in line.lower():
