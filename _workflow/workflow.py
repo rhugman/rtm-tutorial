@@ -3329,7 +3329,8 @@ def merge_training_data(prior_master=WS5_MASTER, prior_template=WS3,
 
 def build_dsivc(merged=None, dsivc_template=WS7_DSIVC, runstore=WS7_DSIVC_RUNSTORE, template_ws=WS3,
                 model_ws=WS, truth_dir=None, seed=20260706, so4_pct=0.95, inner_noptmax=3,
-                mou_pop=40, mou_gens=20, num_reals=300, cond_on_data=False, training="sweep"):
+                mou_pop=40, mou_gens=20, num_reals=300, cond_on_data=False, training="sweep",
+                save_pop_every=10):
     """DSIVC outer optimization over the merged-trained DSI emulator: minimize treatment COST vs
     minimize P<so4_pct> peak recovered-SO4, decision variable f_treat.
 
@@ -3462,7 +3463,7 @@ def build_dsivc(merged=None, dsivc_template=WS7_DSIVC, runstore=WS7_DSIVC_RUNSTO
     pst.pestpp_options["mou_objectives"] = ",".join(objs)
     pst.pestpp_options["mou_generator"] = "de"               # offspring operator (nsga2 is the env selector)
     pst.pestpp_options["mou_env_selector"] = "nsga"          # Pareto/crowding selection (NSGA-II)
-    pst.pestpp_options["mou_save_population_every"] = 1
+    pst.pestpp_options["mou_save_population_every"] = save_pop_every   # sparse gen snapshots (disk); archive always saved
     pst.control_data.noptmax = mou_gens                       # NSGA-II generations (0 = setup only)
     pst.write(str(dsivc_template / "dsivc.pst"), version=2)
     cond_desc = f"{len(cond)} monitored obs / {len(groups)} phi groups + f_treat" if cond_on_data \
@@ -3721,16 +3722,19 @@ def _front_shift(arc, arc_prev, p95_col, npts=50):
 
 def run_dsivc_outer_loop(n_iters=10, gens_per_iter=50, mou_pop=100, explore_frac=0.5,
                          num_workers=None, condor_kwargs=None, alpha=0.6, beta=3.0, conv_tol=1.0,
-                         seed=20260707, loop_dir=WS7_LOOP):
+                         seed=20260707, loop_dir=WS7_LOOP, cleanup=True, save_pop_every=10):
     """Iterative FOM-retrain outer loop (ADR-0003). Each iteration: run a short (gens_per_iter) MOU on
     the current DSI (WARM-STARTED from the previous Pareto front), pick n_f Pareto-optimal decvar vectors
     spread across the cost front (infill_points -- generalises to the full f_treat + per-screen decvar
     space), run one pool-filling paired-CRN FOM wave at those combos, append to the training set, refit.
     EARLY-STOPS when the Pareto front stops moving (max |dP95| at matched cost < conv_tol mg/L).
 
-    Every iteration's MOU master (ALL generations: dsivc.<g>.{dv,obs}_pop.csv + archive) and the
-    accumulated FOM cloud are preserved under loop_dir/iterNN/ so sweep_vs_dsivc frames can be rendered
-    per (iter, generation) for a movement GIF."""
+    DISK: each iteration keeps only master/ (the MOU archive + every-save_pop_every-th generation
+    snapshot -- enough for the figs) plus the small csvs (train_fom_cloud, infill_train, infill_points).
+    When cleanup=True the per-iter dead weight is deleted at the end of the iter -- the full 464k-obs FOM
+    jcb (already thinned into infill_train.csv), the MOU template+runstore (binaries/pickle/noise), and
+    the infill par ensemble -- so the loop's footprint stays ~one master per iteration, not GBs. The
+    accumulated FOM cloud + per-(iter,generation) frames are still renderable from what remains."""
     import os
     import plot_dsivc as _pl
     loop_dir = Path(loop_dir)
@@ -3755,7 +3759,7 @@ def run_dsivc_outer_loop(n_iters=10, gens_per_iter=50, mou_pop=100, explore_frac
         #    WARM-START from iter k-1's Pareto front (archive elites + fresh diversity) so the loop
         #    refines the front without collapsing to clones.
         build_dsivc(train, dsivc_template=tdir, runstore=rstore, mou_gens=gens_per_iter,
-                    mou_pop=mou_pop, training="asis")
+                    mou_pop=mou_pop, training="asis", save_pop_every=save_pop_every)
         if prev_master is not None:
             seed_dvpop_from_archive(prev_master, tdir, seed=seed + k)
         run_dsivc_mou(dsivc_template=tdir, master_dir=mdir, num_workers=num_workers, condor_kwargs=condor_kwargs)
@@ -3781,8 +3785,10 @@ def run_dsivc_outer_loop(n_iters=10, gens_per_iter=50, mou_pop=100, explore_frac
         rows, _ = _fom_training_rows(it / "infill_master", index_prefix=f"i{k}r")
         train = pd.concat([train, rows], axis=0)
 
-        # preserve GIF backdrop + infill bookkeeping
+        # preserve GIF backdrop + the THINNED infill training rows (so the full FOM obs jcb can be
+        # deleted and the run stays resumable) + infill bookkeeping
         train[["f_treat", "fore_peak_so4"]].to_csv(it / "train_fom_cloud.csv")
+        rows.to_csv(it / "infill_train.csv")
         dv_points.to_csv(it / "infill_points.csv", index=False)
 
         # 7. convergence on the Pareto front
@@ -3790,6 +3796,14 @@ def run_dsivc_outer_loop(n_iters=10, gens_per_iter=50, mou_pop=100, explore_frac
         print(f"  [outer_loop] iter {k}: n_train={train.shape[0]}, archive n={0 if arc is None else len(arc)}, "
               f"front_shift={'n/a' if shift is None else f'{shift:.2f} mg/L'}")
         prev_arc, prev_master = arc, mdir
+
+        # 8. DISK: drop this iter's dead weight -- the full 464k-obs FOM jcb (already thinned into
+        #    infill_train.csv), the MOU template/runstore (binaries+pickle+noise, only needed during the
+        #    run), and the infill par ensemble. Keep master/ (archive drives warm-start + figs) + the csvs.
+        if cleanup:
+            for junk in (it / "infill_master", tdir, rstore, it / "infill_pe.jcb"):
+                shutil.rmtree(junk, ignore_errors=True) if junk.is_dir() else junk.unlink(missing_ok=True)
+
         if shift is not None and shift < conv_tol:
             print(f"  [outer_loop] CONVERGED (front shift {shift:.2f} < {conv_tol} mg/L) at iter {k}")
             break
