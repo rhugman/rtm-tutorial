@@ -464,8 +464,168 @@ def render_loop_frames(loop_dir=None, per_gen=True, freeze_axes=True):
     return frames
 
 
+# ----- screen-choice vs SO4 objective figures ----------------------------------------------------
+
+SCREEN_DVS = [f"swin_l{L}" for L in (1, 2, 3, 5, 7)] + [f"swout_l{L}" for L in (1, 3, 5)]
+
+
+def _screen_label(d):
+    """swin_l3 -> 'inj L3', swout_l5 -> 'rec L5'."""
+    well, lay = d.split("_l")
+    return f"{'inj' if well == 'swin' else 'rec'} L{lay}"
+
+
+def _map_screen_obs(obsdata):
+    """{echo obsnme -> decvar name} for the obgnme='screen' echo obs in a sweep pst."""
+    m = {}
+    for o in obsdata.index:
+        if obsdata.loc[o, "obgnme"] == "screen":
+            ol = o.lower()
+            hit = next((D for D in SCREEN_DVS if f"item:{D}".lower() in ol or ol.endswith(D.lower())), None)
+            if hit:
+                m[ol] = hit
+    return m
+
+
+def load_sweep_screens(sweep_master, sweep_template):
+    """Per-realization f_treat + peak recovered-SO4 + the 8 screen toggle values, from the sweep."""
+    import pyemu
+    pst = pyemu.Pst(str(Path(sweep_template) / "pest.pst"))
+    pst.try_parse_name_metadata()
+    oe = pyemu.ObservationEnsemble.from_binary(pst=pst, filename=str(Path(sweep_master) / "pest.0.obs.jcb"))
+    df = pd.DataFrame(oe.values, index=oe.index.astype(str), columns=[c.lower() for c in oe.columns])
+    o = pst.observation_data
+    fc = [c.lower() for c in o.index[o.obgnme == "forecast"]]
+    ft = [c.lower() for c in o.index[o.obgnme == "ftreat"]][0]
+    smap = _map_screen_obs(o)
+    out = pd.DataFrame({"f_treat": df[ft].values, "peak_so4": df[fc].max(axis=1).values})
+    for ol, D in smap.items():
+        out[D] = df[ol].values
+    return out
+
+
+def load_archive_screens(dsivc_master):
+    """DSIVC archive: f_treat + 8 screen decvars (dv_pop) joined to cost + SO4 stack-stats (obs_pop)."""
+    dv = pd.read_csv(Path(dsivc_master) / "dsivc.archive.dv_pop.csv").set_index("real_name")
+    ob = pd.read_csv(Path(dsivc_master) / "dsivc.archive.obs_pop.csv").set_index("real_name")
+    keep = [c for c in ["cost", PMIN, PMEAN, P95, PMAX] if c in ob.columns]
+    return dv.join(ob[keep])
+
+
+def fig_screen_effect(sweep_master, sweep_template):
+    """How each injection/recovery screen choice moves the recovered-SO4 objective, from the sweep
+    (screens varied U[0,1], f_treat varied independently so it averages out of the ON/OFF contrast):
+    (a) OFF->ON shift in mean peak-SO4 per screen (dumbbell, sorted; blue lowers SO4 = helps the
+        minimize objective, red raises it), with the f_treat lever as scale reference;
+    (b) the peak-SO4 distribution OFF vs ON per screen (is the shift real vs the spread?)."""
+    apply_style()
+    s = load_sweep_screens(sweep_master, sweep_template)
+    screens = [c for c in SCREEN_DVS if c in s.columns]
+    rows = []
+    for c in screens:
+        on = s.loc[s[c] >= 0.5, "peak_so4"]
+        off = s.loc[s[c] < 0.5, "peak_so4"]
+        rows.append(dict(screen=c, off=off.mean(), on=on.mean(), delta=on.mean() - off.mean(),
+                         on_vals=on.values, off_vals=off.values))
+    eff = pd.DataFrame(rows).sort_values("delta").reset_index(drop=True)
+    # f_treat reference: same ON/OFF-at-0.5 contrast, for scale
+    ft_delta = s.loc[s.f_treat >= 0.5, "peak_so4"].mean() - s.loc[s.f_treat < 0.5, "peak_so4"].mean()
+
+    fig, (a0, a1) = plt.subplots(1, 2, figsize=(13, 5.8))
+    y = np.arange(len(eff))
+    good, bad = ROLE["emulated"], "crimson"
+    for i, r in eff.iterrows():
+        col = good if r["delta"] < 0 else bad
+        a0.plot([r["off"], r["on"]], [i, i], color=col, lw=2.4, alpha=0.8, zorder=2)
+        a0.scatter(r["off"], i, color="0.6", s=55, zorder=3)
+        a0.scatter(r["on"], i, color=col, s=70, edgecolor="k", linewidth=0.4, zorder=4)
+    a0.axvline(s["peak_so4"].mean(), color="0.5", ls=":", lw=1.1, zorder=1)
+    a0.set_yticks(y)
+    a0.set_yticklabels([_screen_label(c) for c in eff["screen"]])
+    a0.set_xlabel("mean peak recovered SO$_4$ (mg/L)")
+    a0.set_title("Screen OFF → ON shift in the SO$_4$ objective", fontsize=12)
+    a0.legend(handles=[Line2D([], [], color="0.6", marker="o", ls="none", label="OFF (screen inactive)"),
+                       Line2D([], [], color=good, marker="o", ls="none", mec="k", label="ON — lowers SO$_4$ (helps)"),
+                       Line2D([], [], color=bad, marker="o", ls="none", mec="k", label="ON — raises SO$_4$"),
+                       Line2D([], [], color="0.5", ls=":", label="overall mean")],
+              fontsize=8, loc="lower right")
+
+    # (b) OFF vs ON distributions per screen (paired boxes), same screen order
+    for i, r in eff.iterrows():
+        bp = a1.boxplot([r["off_vals"], r["on_vals"]], positions=[i - 0.18, i + 0.18], widths=0.32,
+                        vert=False, patch_artist=True, showfliers=False, manage_ticks=False)
+        col = good if r["delta"] < 0 else bad
+        for patch, fc in zip(bp["boxes"], ("0.75", col)):
+            patch.set_facecolor(fc)
+            patch.set_alpha(0.65)
+            patch.set_edgecolor("k")
+            patch.set_linewidth(0.5)
+        for med in bp["medians"]:
+            med.set_color("k")
+    a1.set_yticks(y)
+    a1.set_yticklabels([_screen_label(c) for c in eff["screen"]])
+    a1.set_xlabel("peak recovered SO$_4$ (mg/L)")
+    a1.set_title("Peak SO$_4$ distribution: OFF (grey) vs ON", fontsize=12)
+
+    fig.suptitle(f"Injection/recovery screen choice vs the recovered-SO$_4$ objective  "
+                 f"(sweep n={len(s)}; f_treat ON−OFF ref = {ft_delta:+.1f} mg/L)", fontweight="bold")
+    return savefig(fig, "screen_effect", STAGE)
+
+
+def fig_screen_front(dsivc_master):
+    """The optimizer's screen STRATEGY across the Pareto front: a heatmap of each screen's on/off state
+    for the archive members sorted by the SO4 objective (P95, low → high), with the P95-SO4 and cost of
+    each member on top -- shows which inj/recovery screens are opened/closed to reach each SO4 level."""
+    apply_style()
+    a = load_archive_screens(dsivc_master)
+    screens = [c for c in SCREEN_DVS if c in a.columns]
+    if not screens or P95 not in a.columns:
+        raise KeyError(f"no screen decvars / P95 in {dsivc_master}")
+    a = a.sort_values(P95).reset_index(drop=True)
+    active = (a[screens].values.T >= 0.5).astype(float)          # (n_screens, n_members) on/off
+    x = np.arange(len(a))
+
+    fig, (top, hm) = plt.subplots(2, 1, figsize=(12, 6.4), height_ratios=[1, 2.2], sharex=True,
+                                  gridspec_kw=dict(hspace=0.12))
+    top.plot(x, a[P95], color=ROLE["emulated"], lw=2, marker="o", ms=3, label="P95 peak SO$_4$")
+    top.set_ylabel("P95 SO$_4$ (mg/L)", color=ROLE["emulated"])
+    top.tick_params(axis="y", colors=ROLE["emulated"])
+    t2 = top.twinx()
+    t2.plot(x, a["cost"], color=ROLE["forecast"], lw=1.6, ls=":", label="cost")
+    t2.set_ylabel("cost", color=ROLE["forecast"])
+    t2.tick_params(axis="y", colors=ROLE["forecast"])
+    t2.grid(False)
+    top.set_title("Pareto front — objective per member (P95 SO$_4$) + cost", fontsize=12)
+
+    im = hm.imshow(active, aspect="auto", cmap=mpl.colors.ListedColormap(["white", ROLE["emulated"]]),
+                   vmin=0, vmax=1, interpolation="nearest",
+                   extent=[-0.5, len(a) - 0.5, len(screens) - 0.5, -0.5])
+    hm.set_xticks(np.arange(0.5, len(a) - 0.5), minor=True)      # cell-boundary gridlines for readability
+    hm.set_yticks(np.arange(0.5, len(screens) - 0.5), minor=True)
+    hm.grid(which="minor", color="0.8", lw=0.5)
+    hm.tick_params(which="minor", length=0)
+    hm.set_yticks(range(len(screens)))
+    hm.set_yticklabels([_screen_label(c) for c in screens])
+    hm.axhline(4.5, color="k", lw=1.4)                           # divide injection (top) from recovery (bottom)
+    hm.text(-0.06, 0.78, "inject", transform=hm.transAxes, rotation=90, va="center", ha="center", fontsize=9)
+    hm.text(-0.06, 0.20, "recover", transform=hm.transAxes, rotation=90, va="center", ha="center", fontsize=9)
+    hm.set_xlabel("Pareto member (sorted by P95 SO$_4$: low/expensive → high/cheap)")
+    hm.set_title("Screen on/off across the front (green = active, white = off)", fontsize=12)
+
+    fig.suptitle("Injection/recovery screen strategy along the DSIVC Pareto front", fontweight="bold")
+    return savefig(fig, "screen_front", STAGE)
+
+
 if __name__ == "__main__":
     base = Path(__file__).parent
+    if "--screens" in sys.argv:
+        print(f"[plot_dsivc] wrote {fig_screen_effect(base / '_s7_sweep_master', base / '_s7_sweep_template')}")
+        md = base / "_s7_dsivc_master"
+        if (md / "dsivc.archive.dv_pop.csv").exists():
+            print(f"[plot_dsivc] wrote {fig_screen_front(md)}")
+        else:
+            print("[plot_dsivc] no DSIVC archive -> skipped fig_screen_front")
+        sys.exit(0)
     if "--sweep" in sys.argv:
         print(f"[plot_dsivc] wrote {fig_sweep_tradeoff(base / '_s7_sweep_master', base / '_s7_sweep_template')}")
         sys.exit(0)
