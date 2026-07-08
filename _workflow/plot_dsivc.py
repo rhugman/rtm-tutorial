@@ -202,22 +202,27 @@ def _draw_overlay(fig, a0, a1, cloud, arc, tpk, cloud_label="full-model sweep",
     the FOM ground-truth cloud (cols f_treat/cost/peak_so4) + the DSIVC Pareto (arc) on ONE f_treat
     colorscale. new_pts (cols f_treat/cost/peak_so4) are highlighted as red stars -- the FOM samples
     just added this iteration. Pass fixed ylim / xlim_cost to keep axes steady across an animation."""
-    arc = arc.sort_values("f_treat").reset_index(drop=True)
-    af = arc.sort_values("cost")
+    has_arc = arc is not None and len(arc)
+    if has_arc:
+        arc = arc.sort_values("f_treat").reset_index(drop=True)
+        af = arc.sort_values("cost")
 
-    # (a) cost vs SO4 -- cloud + f_treat-graded Pareto (line + markers), neutral min-max whiskers
+    # (a) cost vs SO4 -- the FOM cloud always; the f_treat-graded Pareto (line + markers + min-max
+    #     whiskers) only when a front is supplied (arc=None -> the starting-point sweep alone)
     sc = a0.scatter(cloud["cost"], cloud["peak_so4"], c=cloud["f_treat"], cmap=FT_CMAP, norm=FT_NORM,
                     s=28, edgecolor="none", alpha=0.5, zorder=3)
     cb = fig.colorbar(sc, ax=a0)
-    cb.set_label("$f_{treat}$ (cloud + Pareto)")
-    a0.errorbar(af["cost"], af[P95], yerr=[(af[P95] - af[PMIN]).clip(lower=0),
-                (af[PMAX] - af[P95]).clip(lower=0)], fmt="none", ecolor="0.45",
-                elinewidth=0.9, capsize=2, alpha=0.6, zorder=5)
-    _grad_line(a0, af["cost"].values, af[P95].values, af["f_treat"].values, lw=1.8, zorder=6)
-    a0.scatter(af["cost"], af[P95], c=af["f_treat"], cmap=FT_CMAP, norm=FT_NORM, s=46,
-               edgecolor="k", linewidth=0.4, zorder=7)
-    hh = [Line2D([], [], color=plt.get_cmap(FT_CMAP)(0.5), marker="o", ls="-", lw=1.8, mec="k",
-                 mew=0.4, label=f"DSIVC Pareto (P95 + min–max, n={len(af)})")]
+    cb.set_label("$f_{treat}$ (cloud + Pareto)" if has_arc else "$f_{treat}$ (FOM sweep)")
+    hh = []
+    if has_arc:
+        a0.errorbar(af["cost"], af[P95], yerr=[(af[P95] - af[PMIN]).clip(lower=0),
+                    (af[PMAX] - af[P95]).clip(lower=0)], fmt="none", ecolor="0.45",
+                    elinewidth=0.9, capsize=2, alpha=0.6, zorder=5)
+        _grad_line(a0, af["cost"].values, af[P95].values, af["f_treat"].values, lw=1.8, zorder=6)
+        a0.scatter(af["cost"], af[P95], c=af["f_treat"], cmap=FT_CMAP, norm=FT_NORM, s=46,
+                   edgecolor="k", linewidth=0.4, zorder=7)
+        hh.append(Line2D([], [], color=plt.get_cmap(FT_CMAP)(0.5), marker="o", ls="-", lw=1.8, mec="k",
+                         mew=0.4, label=f"DSIVC Pareto (P95 + min–max, n={len(af)})"))
     if new_pts is not None and len(new_pts):
         a0.scatter(new_pts["cost"], new_pts["peak_so4"], marker="*", s=130, c="red",
                    edgecolor="k", linewidth=0.5, zorder=9)
@@ -225,20 +230,23 @@ def _draw_overlay(fig, a0, a1, cloud, arc, tpk, cloud_label="full-model sweep",
                          label=f"new FOM samples (n={len(new_pts)})"))
     a0.set_xlabel(LBL["cost"])
     a0.set_ylabel("peak recovered SO$_4$ (mg/L)")
-    a0.legend(handles=hh, fontsize=8, loc="upper right")
-    a0.set_title("Cost vs SO$_4$: FOM cloud + DSIVC front", fontsize=12)
+    if hh:
+        a0.legend(handles=hh, fontsize=8, loc="upper right")
+    a0.set_title("Cost vs SO$_4$: FOM cloud + DSIVC front" if has_arc
+                 else "Cost vs SO$_4$: initial FOM training sweep", fontsize=12)
 
-    # (b) SO4 vs f_treat -- neutral cloud + f_treat-coloured Pareto whiskered by the DSI stack min-max
+    # (b) SO4 vs f_treat -- neutral cloud always; f_treat-coloured Pareto (stack min-max) only if present
     a1.scatter(cloud["f_treat"], cloud["peak_so4"], s=28, color="0.7", edgecolor="none",
                alpha=0.5, zorder=3)
-    a1.errorbar(arc["f_treat"], arc[PMEAN], yerr=[(arc[PMEAN] - arc[PMIN]).clip(lower=0),
-                (arc[PMAX] - arc[PMEAN]).clip(lower=0)], fmt="none", ecolor="0.45",
-                elinewidth=0.9, capsize=2, alpha=0.7, zorder=4)
-    a1.scatter(arc["f_treat"], arc[PMEAN], c=arc["f_treat"], cmap=FT_CMAP, norm=FT_NORM, s=44,
-               edgecolor="k", linewidth=0.4, zorder=5)
-    hh1 = [Line2D([], [], color="0.7", marker="o", ls="none", label=cloud_label),
-           Line2D([], [], color=plt.get_cmap(FT_CMAP)(0.5), marker="o", ls="none", mec="k", mew=0.4,
-                  label="DSIVC stack (mean, min–max)")]
+    hh1 = [Line2D([], [], color="0.7", marker="o", ls="none", label=cloud_label)]
+    if has_arc:
+        a1.errorbar(arc["f_treat"], arc[PMEAN], yerr=[(arc[PMEAN] - arc[PMIN]).clip(lower=0),
+                    (arc[PMAX] - arc[PMEAN]).clip(lower=0)], fmt="none", ecolor="0.45",
+                    elinewidth=0.9, capsize=2, alpha=0.7, zorder=4)
+        a1.scatter(arc["f_treat"], arc[PMEAN], c=arc["f_treat"], cmap=FT_CMAP, norm=FT_NORM, s=44,
+                   edgecolor="k", linewidth=0.4, zorder=5)
+        hh1.append(Line2D([], [], color=plt.get_cmap(FT_CMAP)(0.5), marker="o", ls="none", mec="k",
+                          mew=0.4, label="DSIVC stack (mean, min–max)"))
     if new_pts is not None and len(new_pts):
         a1.scatter(new_pts["f_treat"], new_pts["peak_so4"], marker="*", s=130, c="red",
                    edgecolor="k", linewidth=0.5, zorder=9)
@@ -247,7 +255,8 @@ def _draw_overlay(fig, a0, a1, cloud, arc, tpk, cloud_label="full-model sweep",
     a1.set_xlabel(LBL["ftreat"])
     a1.set_ylabel("peak recovered SO$_4$ (mg/L)")
     a1.legend(handles=hh1, fontsize=8, loc="upper right")
-    a1.set_title("SO$_4$ vs $f_{treat}$: cloud vs DSIVC stack range", fontsize=12)
+    a1.set_title("SO$_4$ vs $f_{treat}$: cloud vs DSIVC stack range" if has_arc
+                 else "SO$_4$ vs $f_{treat}$: initial FOM training sweep", fontsize=12)
     if ylim is not None:
         a0.set_ylim(*ylim)
         a1.set_ylim(*ylim)
@@ -405,6 +414,18 @@ def render_loop_frames(loop_dir=None, per_gen=True, freeze_axes=True):
             xlim = (-0.03 * max(cmax), 1.03 * max(cmax))
 
     frames, idx = [], 0
+    # frame 0: the initial FOM training sweep ALONE (no DSIVC front) -- the starting point
+    start_cloud = backdrop_for(iters[0])
+    if start_cloud is not None:
+        apply_style()
+        fig, (a0, a1) = plt.subplots(1, 2, figsize=(13, 5.2))
+        _draw_overlay(fig, a0, a1, start_cloud, None, None,
+                      cloud_label=f"FOM training sweep (n={len(start_cloud)})", ylim=ylim, xlim_cost=xlim)
+        fig.suptitle(f"Starting point — initial FOM training sweep (n={len(start_cloud)}), no DSIVC front yet",
+                     fontweight="bold")
+        frames.append(savefig(fig, f"frame_{idx:03d}", f"{STAGE}/frames"))
+        idx += 1
+
     for it in iters:
         k = int(it.name.replace("iter", ""))
         bd = backdrop_for(it)
