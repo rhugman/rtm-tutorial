@@ -1714,7 +1714,7 @@ def draw_prior_ensemble(pf, num_reals, template_ws=WS3, seed=20260706):
     template_ws = Path(template_ws)
     if pf.pst.npar < 35000:
         pf.build_prior(fmt="coo", filename=str(template_ws / "prior_cov.jcb"))
-    pe = pf.draw(num_reals=num_reals, use_specsim=False)
+    pe = pf.draw(num_reals=num_reals, use_specsim=False, rng=np.random.RandomState(seed))  # explicit rng: reproducible
     pe.enforce()
     rng = np.random.default_rng(seed)
     pe.loc[:, "pyr-lograte"] = np.clip(rng.normal(16.0, 0.5, pe.shape[0]), 15.0, 17.0)
@@ -2771,7 +2771,8 @@ def build_dsi_conditioning(master_dir=WS5_MASTER, template_ws=WS3, dsi_template=
     dpst.pestpp_options["ies_phi_factor_file"] = "ies_phi_factors.csv"
 
     # (d) correlated observation-noise ensemble (one shock per site:species series per real)
-    noise = pyemu.ObservationEnsemble.from_gaussian_draw(dpst, num_reals=num_reals)
+    noise = pyemu.ObservationEnsemble.from_gaussian_draw(dpst, num_reals=num_reals,
+                                                         rng=np.random.RandomState(seed))
     rng = np.random.default_rng(seed)
     for grp, g in dobs.loc[cond].groupby("obgnme"):
         z = rng.standard_normal(num_reals)[:, None]
@@ -2826,7 +2827,7 @@ _S6_FOM_WORKER_ROOT = Path(__file__).parent / "_s6_fom_workers"
 
 
 def build_fom_conditioning(src_template=WS3, fom_template=WS_FOM, prior_master=WS5_MASTER,
-                           num_workers=60, seed=20260706, noptmax=1):
+                           num_workers=60, seed=20260706, noptmax=1, subset_size=56):
     """Build a FULL-OUTPUT-MODEL (FOM) pestpp-ies history match -- the gold-standard the DSI-emulator
     posterior is compared against. Mirrors ``build_dsi_conditioning`` EXACTLY on the real model
     interface: targets = synthetic truth (already in obsval from stage 4), per-obs PROPORTIONAL weights
@@ -2881,7 +2882,8 @@ def build_fom_conditioning(src_template=WS3, fom_template=WS_FOM, prior_master=W
     num_reals = pe.shape[0]
 
     # (e) correlated observation-noise ensemble -- identical construction/seed to build_dsi_conditioning
-    noise = pyemu.ObservationEnsemble.from_gaussian_draw(pst, num_reals=num_reals)
+    noise = pyemu.ObservationEnsemble.from_gaussian_draw(pst, num_reals=num_reals,
+                                                         rng=np.random.RandomState(seed))
     rng = np.random.default_rng(seed)
     for grp, g in obs.loc[cond].groupby("obgnme"):
         z = rng.standard_normal(num_reals)[:, None]
@@ -2891,14 +2893,17 @@ def build_fom_conditioning(src_template=WS3, fom_template=WS_FOM, prior_master=W
         noise._df.loc[:, g.index] = vv
     noise.to_binary(str(fom_template / "noise.jcb"))
 
-    # (f) ies_* solver options -- SAME as the DSI conditioning except ies_subset_size = num_workers
+    # (f) ies_* solver options -- SAME as the DSI conditioning except a FIXED ies_subset_size
     fore = list(obs.index[obs.obgnme == "forecast"])
     pst.pestpp_options["ies_par_en"] = "fom_pe.jcb"
     pst.pestpp_options["ies_observation_ensemble"] = "noise.jcb"
     pst.pestpp_options["forecasts"] = ",".join(fore)
     pst.pestpp_options["ies_num_reals"] = num_reals
     pst.pestpp_options["save_binary"] = True
-    pst.pestpp_options["ies_subset_size"] = num_workers    # THE exception (DSI used -100)
+    # FIXED subset size (not num_workers) so the IES lambda test -- hence the posterior -- is REPRODUCIBLE
+    # regardless of the deployed worker count. Workers only parallelise; they don't change which reals the
+    # lambda test uses. (Was = num_workers, which made the FOM posterior depend on the pool size.)
+    pst.pestpp_options["ies_subset_size"] = subset_size
     pst.pestpp_options["ies_drop_conflicts"] = True
     pst.pestpp_options.pop("ies_autoadaloc", None)         # off, matching the DSI conditioning
     pst.pestpp_options.pop("ies_multimodal_alpha", None)   # off
@@ -2906,7 +2911,7 @@ def build_fom_conditioning(src_template=WS3, fom_template=WS_FOM, prior_master=W
     pst.control_data.noptmax = noptmax
     pst.write(str(fom_template / "pest.pst"), version=2)
     print(f"  [build_fom_conditioning] {len(cond)} weighted obs, {len(groups)} phi groups, "
-          f"{len(fore)} forecast obs, {num_reals} reals, subset_size={num_workers}, noptmax={noptmax}")
+          f"{len(fore)} forecast obs, {num_reals} reals, subset_size={subset_size} (fixed), noptmax={noptmax}")
     return pst, fore
 
 
@@ -3437,7 +3442,8 @@ def build_dsivc(merged=None, dsivc_template=WS7_DSIVC, runstore=WS7_DSIVC_RUNSTO
     # obs-noise ensemble DSIVC harvests: fill=True keeps ALL obs as columns (incl. the zero-weight f_treat
     # decvar), which DSIVC requires. With decvar-only conditioning every monitored obs is zero-weight, so
     # the correlated-shock loop is a no-op and the harvested noise is inert on the measured obs.
-    noise = pyemu.ObservationEnsemble.from_gaussian_draw(dpst, num_reals=num_reals, fill=True)
+    noise = pyemu.ObservationEnsemble.from_gaussian_draw(dpst, num_reals=num_reals, fill=True,
+                                                         rng=np.random.RandomState(seed))
     rng = np.random.default_rng(seed)
     for grp, g in dobs.loc[cond].groupby("obgnme"):
         z = rng.standard_normal(num_reals)[:, None]
@@ -3726,7 +3732,7 @@ def _front_shift(arc, arc_prev, p95_col, npts=50):
     return float(np.max(np.abs(np.interp(grid, a["cost"], a[p95_col]) - np.interp(grid, b["cost"], b[p95_col]))))
 
 
-def run_dsivc_outer_loop(n_iters=100, gens_per_iter=50, mou_pop=100,
+def run_dsivc_outer_loop(n_iters=100, gens_per_iter=50, mou_pop=100, wave_size=56,
                          num_workers=None, condor_kwargs=None, alpha=0.6, beta=3.0, conv_tol=1.0,
                          seed=20260707, loop_dir=WS7_LOOP, cleanup=True, save_pop_every=10, resume=True):
     """Iterative FOM-retrain outer loop (ADR-0003). Each iteration: run a short (gens_per_iter) MOU on
@@ -3751,7 +3757,9 @@ def run_dsivc_outer_loop(n_iters=100, gens_per_iter=50, mou_pop=100,
     loop_dir.mkdir(exist_ok=True)
     if num_workers is None:
         num_workers = CONDOR_DEFAULTS["n_workers"] if _htcondor_available() else max(1, (os.cpu_count() or 2) - 1)
-    n_runs = num_workers                                # one FOM run per worker = one unique (param, decvar) pair
+    # infill wave size is FIXED (reproducible), DECOUPLED from num_workers -- workers only parallelise the
+    # wave_size FOM runs, they do not change how many decvar samples are drawn along the front.
+    n_runs = wave_size
     P95 = "fore_peak_so4_stat:95%"
     print(f"[outer_loop] {n_iters} iters max, {gens_per_iter}-gen MOU each, wave = {n_runs} unique "
           f"(param, decvar) FOM runs along the front, early-stop at front shift < {conv_tol} mg/L")
