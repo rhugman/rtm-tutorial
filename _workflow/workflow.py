@@ -3553,25 +3553,36 @@ def infill_ftreat(archive_ft, train_ft=None, n_f=8, prev_res=None, alpha=0.6, be
     return np.interp(q, cdf, grid)
 
 
-def infill_points(archive, decvars, n_runs, obj_col="cost"):
-    """Sample n_runs decvar VECTORS spread ALONG the Pareto front (one per FOM run). The archive is
-    sorted by the objective (obj_col=cost); n_runs positions are laid evenly along it and each decvar
-    vector is linearly interpolated between the two bracketing members. The two EXTREME front individuals
-    (the endpoints in obj_col -- cheapest/highest-SO4 and most-treated/lowest-SO4) are ALWAYS included
-    exactly (they are the linspace endpoints). Interpolation makes it work whether the archive is larger
-    OR smaller than n_runs, and every run gets a UNIQUE decvar sample covering the whole front (paired 1:1
-    with a unique parameter realisation in build_infill_par_ensemble). Returns an (n_runs x n_dv) frame."""
+def infill_points(archive, decvars, n_runs, obj_cols=("cost",)):
+    """Sample n_runs decvar VECTORS evenly along the Pareto front BY DISTANCE -- arc length in normalized
+    objective space (obj_cols, e.g. cost + P95-SO4) -- NOT by member index. Uniform-in-index over-samples
+    wherever the archive packs members (on this near-1-D front NSGA-II stacks many screen configs at the
+    same cost/SO4), which clusters the runs; arc-length spacing collapses those stacks and spreads the FOM
+    runs evenly across the real trade-off curve. The two EXTREME front individuals (the arc-length
+    endpoints) are ALWAYS included exactly; the decvar vector is interpolated within each front segment.
+    Works whether the archive is larger OR smaller than n_runs; every run gets a UNIQUE decvar sample
+    (paired 1:1 with a unique parameter realisation in build_infill_par_ensemble)."""
     cols = [d for d in decvars if d in archive.columns]
-    arc = archive.dropna(subset=[obj_col]).sort_values(obj_col).reset_index(drop=True)
-    V = arc[cols].to_numpy(dtype=float)                          # (M, n_dv), sorted along the front
+    ocols = [c for c in obj_cols if c in archive.columns] or [obj_cols[0]]
+    arc = archive.dropna(subset=ocols).sort_values(list(ocols)).reset_index(drop=True)
+    V = arc[cols].to_numpy(dtype=float)                          # (M, n_dv), ordered along the front
     M = V.shape[0]
     if M == 1:
         return pd.DataFrame(np.repeat(V, n_runs, axis=0), columns=cols)
-    pos = np.linspace(0.0, M - 1, n_runs)                        # endpoints 0 and M-1 = the two extremes
-    lo = np.floor(pos).astype(int)
-    hi = np.clip(lo + 1, 0, M - 1)
-    frac = (pos - lo)[:, None]
-    X = V[lo] * (1.0 - frac) + V[hi] * frac                      # interp the decvar vector along the front
+    O = arc[ocols].to_numpy(dtype=float)
+    span = O.max(axis=0) - O.min(axis=0)
+    span[span == 0] = 1.0
+    On = (O - O.min(axis=0)) / span                             # each objective normalized to [0,1]
+    s = np.concatenate([[0.0], np.cumsum(np.sqrt(((On[1:] - On[:-1]) ** 2).sum(axis=1)))])  # cumulative arc length
+    L = s[-1]
+    if L == 0:                                                  # all members at one objective point
+        return pd.DataFrame(np.repeat(V[:1], n_runs, axis=0), columns=cols)
+    tgt = np.linspace(0.0, L, n_runs)                           # even by ARC LENGTH; endpoints = the extremes
+    j = np.clip(np.searchsorted(s, tgt, side="right") - 1, 0, M - 2)
+    seg = s[j + 1] - s[j]
+    seg[seg == 0] = 1.0
+    frac = ((tgt - s[j]) / seg)[:, None]
+    X = V[j] * (1.0 - frac) + V[j + 1] * frac                   # interp the decvar vector within each segment
     return pd.DataFrame(X, columns=cols)
 
 
@@ -3783,13 +3794,14 @@ def run_dsivc_outer_loop(n_iters=100, gens_per_iter=50, mou_pop=100,
         run_dsivc_mou(dsivc_template=tdir, master_dir=mdir, num_workers=num_workers, condor_kwargs=condor_kwargs)
         arc = _pl.load_archive(str(mdir))
 
-        # 2-3. infill: n_runs decvar VECTORS spread ALONG the Pareto front (extremes always included),
-        #      one per FOM run. Read the full archive dv_pop (all decvars) + cost for the front ordering.
+        # 2-3. infill: n_runs decvar VECTORS spread evenly by ARC LENGTH along the Pareto front in (cost,
+        #      P95-SO4) objective space (extremes always included), one per FOM run. Read the full archive
+        #      dv_pop (all decvars) + both objectives for the front geometry.
         decvars = ["f_treat"] + [d for d in SCREEN_DVS if d in train.columns]
         dvpop = pd.read_csv(mdir / "dsivc.archive.dv_pop.csv").set_index("real_name")
         obpop = pd.read_csv(mdir / "dsivc.archive.obs_pop.csv").set_index("real_name")
-        front = dvpop.join(obpop["cost"])
-        dv_points = infill_points(front, decvars, n_runs, obj_col="cost")
+        front = dvpop.join(obpop[[c for c in ("cost", P95) if c in obpop.columns]])
+        dv_points = infill_points(front, decvars, n_runs, obj_cols=("cost", P95))
 
         # 4-5. FOM wave -- each run a UNIQUE (param realisation, front decvar) pair
         pe_path = it / "infill_pe.jcb"
