@@ -3330,7 +3330,7 @@ def merge_training_data(prior_master=WS5_MASTER, prior_template=WS3,
 def build_dsivc(merged=None, dsivc_template=WS7_DSIVC, runstore=WS7_DSIVC_RUNSTORE, template_ws=WS3,
                 model_ws=WS, truth_dir=None, seed=20260706, so4_pct=0.95, inner_noptmax=3,
                 mou_pop=40, mou_gens=20, num_reals=300, cond_on_data=False, training="sweep",
-                save_pop_every=10):
+                save_pop_every=10, min_so4_std=True):
     """DSIVC outer optimization over the merged-trained DSI emulator: minimize treatment COST vs
     minimize P<so4_pct> peak recovered-SO4, decision variable f_treat.
 
@@ -3451,9 +3451,12 @@ def build_dsivc(merged=None, dsivc_template=WS7_DSIVC, runstore=WS7_DSIVC_RUNSTO
                          str(dsivc_template / "cost_obs.csv"), pst_path=".")
     pst.model_command = ["python dsivc_forward_run.py", "python compute_cost.py"]
 
-    # (f) objectives: minimize cost + minimize P<pct> peak recovered-SO4 (obgnme 'less_than' -> minimize)
+    # (f) objectives: minimize cost + minimize P<pct> peak recovered-SO4 (level) + minimize the stack
+    #     std of peak SO4 (forecast uncertainty). obgnme 'less_than' -> minimize.
     so4_obj = f"fore_peak_so4_stat:{int(round(so4_pct * 100))}%"
     objs = ["cost", so4_obj]
+    if min_so4_std:
+        objs.append("fore_peak_so4_stat:std")      # minimize the spread/uncertainty of peak recovered-SO4
     obs = pst.observation_data
     missing = [o for o in objs if o not in obs.index]
     if missing:
