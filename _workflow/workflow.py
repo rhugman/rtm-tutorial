@@ -3224,16 +3224,33 @@ def build_sweep_interface(model_ws=WS, template_ws=WS7_SWEEP, num_reals=N_SWEEP)
     return build_pest_interface(model_ws, template_ws, num_reals=num_reals, with_treatment=True)
 
 
-def draw_sweep_ensemble(sweep_pst, prior_pe_path=WS3 / "prior_pe.jcb", template_ws=WS7_SWEEP,
-                        s3_template=WS3, seed=20260707):
-    """Sweep parameter ensemble = the SAME 120 prior param draws + an independent f_treat~U[0,0.999]
-    column (the paired design). Reuses prior_pe.jcb so params are shared with the f_treat=0 prior MC;
-    the orthogonal f_treat draw lets the emulator separate param vs treatment effects.
-    """
+def fom_posterior_pe_path(fom_master=WS_FOM_MASTER):
+    """The FOM history-match POSTERIOR parameter ensemble: the highest-iteration ``pest.<N>.par.jcb``
+    (N>=1) written by the full-model IES in ``fom_master``. This is the data-conditioned aquifer-parameter
+    ensemble the DSIVC sweep now draws from (in place of the broad prior)."""
+    cands = [p for p in Path(fom_master).glob("pest.*.par.jcb")
+             if p.name.split(".")[1].isdigit() and int(p.name.split(".")[1]) >= 1]
+    if not cands:
+        raise FileNotFoundError(
+            f"no FOM posterior par ensemble (pest.<N>.par.jcb, N>=1) in {fom_master} -- "
+            f"run stage6_fom (full-model IES) before the sweep")
+    return max(cands, key=lambda p: int(p.name.split(".")[1]))
+
+
+def draw_sweep_ensemble(sweep_pst, source_pe_path=None, template_ws=WS7_SWEEP,
+                        s3_template=WS3, seed=20260707, fom_master=WS_FOM_MASTER):
+    """Sweep parameter ensemble = the FOM-POSTERIOR aquifer-parameter draws (history-matched by the
+    full-model IES) + an independent f_treat~U[0,0.999] column and per-screen U[0,1] toggles. Drawing
+    from the posterior (not the prior) bakes the history matching into the DSI training set, so the
+    emulator's forecasts already reflect the data-conditioned parameter uncertainty; the orthogonal
+    decvar draws let the emulator separate the treatment/screen effects from parameter uncertainty.
+    ``source_pe_path`` overrides the auto-located FOM posterior (fom_posterior_pe_path)."""
     import pyemu
     pst_s3 = pyemu.Pst(str(Path(s3_template) / "pest.pst"))
-    pe_prior = pyemu.ParameterEnsemble.from_binary(pst=pst_s3, filename=str(prior_pe_path))
-    df = pe_prior._df.copy()
+    if source_pe_path is None:
+        source_pe_path = fom_posterior_pe_path(fom_master)
+    pe_src = pyemu.ParameterEnsemble.from_binary(pst=pst_s3, filename=str(source_pe_path))
+    df = pe_src._df.copy()
     rng = np.random.default_rng(seed)
     df["f_treat"] = rng.uniform(F_TREAT_BOUNDS[0], F_TREAT_BOUNDS[1], size=df.shape[0])
     for n in SCREEN_DVS:                                      # per-screen on/off toggles ~ U[0,1]
@@ -3243,7 +3260,8 @@ def draw_sweep_ensemble(sweep_pst, prior_pe_path=WS3 / "prior_pe.jcb", template_
     pe.enforce()
     out = Path(template_ws) / "sweep_pe.jcb"
     pe.to_binary(str(out))
-    print(f"  [draw_sweep_ensemble] {pe.shape[0]} reals x {pe.shape[1]} pars (f_treat U{F_TREAT_BOUNDS}) -> {out.name}")
+    print(f"  [draw_sweep_ensemble] {pe.shape[0]} reals x {pe.shape[1]} pars from FOM posterior "
+          f"'{Path(source_pe_path).name}' (+ f_treat U{F_TREAT_BOUNDS}, screens U[0,1]) -> {out.name}")
     return pe
 
 
@@ -3256,7 +3274,9 @@ def run_dsivc_sweep(template_ws=WS7_SWEEP, num_workers=15, master_dir=WS7_SWEEP_
     template_ws, master_dir = Path(template_ws), Path(master_dir)
     pst = pyemu.Pst(str(template_ws / "pest.pst"))
     pst.pestpp_options["ies_par_en"] = "sweep_pe.jcb"
-    pst.pestpp_options["ies_num_reals"] = num_reals
+    # size to the drawn ensemble (the FOM posterior may carry != N_SWEEP reals after IES drops failures)
+    n_sweep = pyemu.ParameterEnsemble.from_binary(pst=pst, filename=str(template_ws / "sweep_pe.jcb")).shape[0]
+    pst.pestpp_options["ies_num_reals"] = n_sweep
     pst.pestpp_options["ies_no_noise"] = True
     pst.pestpp_options["save_binary"] = True
     pst.control_data.noptmax = -1
@@ -3584,13 +3604,15 @@ def _fom_training_rows(master_dir, sweep_template=WS7_SWEEP, s3_template=WS3, in
     return out, fore
 
 
-def build_infill_par_ensemble(dv_points, iter_k, out_path, prior_pe_path=WS3 / "prior_pe.jcb",
-                              sweep_template=WS7_SWEEP, s3_template=WS3, seed=20260707):
+def build_infill_par_ensemble(dv_points, iter_k, out_path, source_pe_path=None,
+                              sweep_template=WS7_SWEEP, s3_template=WS3, seed=20260707,
+                              fom_master=WS_FOM_MASTER):
     """1:1 infill par ensemble -- every FOM run pairs a UNIQUE parameter realisation with a UNIQUE decvar
-    sample. Draw len(dv_points) DISTINCT prior_pe reals (rotated by iter_k) and pair each, in order, with
-    one front decvar vector: run j = param idx[j] + dv_points[j]. No parameter and no decvar combo is
-    reused within the wave, so the (parameter x decvar) samples are maximally dispersed AND spread along
-    the whole front. Sampled without replacement while the ensemble allows.
+    sample. Draw len(dv_points) DISTINCT parameter reals from the FOM POSTERIOR (rotated by iter_k) and
+    pair each, in order, with one front decvar vector: run j = param idx[j] + dv_points[j]. Using the same
+    history-matched posterior as the sweep keeps the whole training set on one consistent parameter
+    baseline. No parameter and no decvar combo is reused within the wave; sampled without replacement
+    while the ensemble allows. ``source_pe_path`` overrides the auto-located FOM posterior.
 
     ``dv_points`` : a DataFrame (n_runs x n_decvars) of front decvar vectors (f_treat + per-screen
     toggles), one per FOM run; a scalar/array of f_treat is also accepted (back-compat)."""
@@ -3600,7 +3622,9 @@ def build_infill_par_ensemble(dv_points, iter_k, out_path, prior_pe_path=WS3 / "
     if not isinstance(dv_points, pd.DataFrame):                 # back-compat: a list/array of f_treat locs
         dv_points = pd.DataFrame({"f_treat": np.asarray(dv_points, float)})
     dv_points = dv_points.reset_index(drop=True)
-    base = pyemu.ParameterEnsemble.from_binary(pst=pst_s3, filename=str(prior_pe_path))._df
+    if source_pe_path is None:
+        source_pe_path = fom_posterior_pe_path(fom_master)
+    base = pyemu.ParameterEnsemble.from_binary(pst=pst_s3, filename=str(source_pe_path))._df
     n = len(dv_points)
     rng = np.random.default_rng(seed + iter_k)
     idx = rng.choice(np.asarray(base.index), size=n, replace=(n > base.shape[0]))   # distinct param reals
@@ -3854,12 +3878,12 @@ def run_all(num_reals=N_PRIOR_MC, num_workers=None, condor_kwargs=None, quantile
           lambda: stage4_truth_weights(quantile=quantile))
     _step("stage 6 -- DSI condition + cross-validation + figures", figs / "06_dsi" / "dsi_forecast.png",
           lambda: regen_figs())
-    _step("stage 7 -- DSIVC f_treat sweep + merge + optimizer", WS7_SWEEP_MASTER / "pest.0.obs.jcb",
-          lambda: stage7_dsivc(num_workers=num_workers, condor_kwargs=condor_kwargs))
-    # FOM (full-model IES) conditioning runs LAST -- it is the expensive independent cross-check of the
-    # emulator, not a prerequisite of any downstream stage, so it should not block the DSIVC arc.
-    _step("stage 6-FOM -- full-model IES history match", WS_FOM_MASTER / "pest.0.obs.jcb",
+    # FOM (full-model IES) conditioning is now a PREREQUISITE of the sweep -- the DSIVC sweep draws its
+    # parameter ensemble from the FOM POSTERIOR (history-matched), so it must run BEFORE stage 7.
+    _step("stage 6-FOM -- full-model IES history match", WS_FOM_MASTER / "pest.1.par.jcb",
           lambda: stage6_fom(num_workers=num_workers, condor_kwargs=condor_kwargs))
+    _step("stage 7 -- DSIVC sweep (FOM-posterior params) + merge + optimizer", WS7_SWEEP_MASTER / "pest.0.obs.jcb",
+          lambda: stage7_dsivc(num_workers=num_workers, condor_kwargs=condor_kwargs))
     print(f"\n{'=' * 72}\n[run_all] DONE -- full DIZON arc complete\n{'=' * 72}", flush=True)
 
 
