@@ -3488,15 +3488,6 @@ def run_dsivc_mou(dsivc_template=WS7_DSIVC, master_dir=WS7_DSIVC_MASTER, num_wor
                           condor_kwargs=condor_kwargs, pestpp_exe="pestpp-mou")
 
 
-def _infill_grid_size(n_workers):
-    """Split one FOM wave that fills the pool into (n_f f_treat locations, K paired param reals).
-    K is biased up (covariance quality for the DSI); n_f fills the remainder. Grows with the pool:
-    N=15 -> (3,4); N=60 -> (7,8); N=120 -> (10,11)."""
-    K = int(np.clip(round(np.sqrt(max(1, n_workers))), 4, 20))
-    n_f = max(3, int(n_workers) // K)
-    return n_f, K
-
-
 def infill_ftreat(archive_ft, train_ft=None, n_f=8, prev_res=None, alpha=0.6, beta=3.0,
                   delta=None, bounds=None, ngrid=1001):
     """Pick n_f f_treat infill locations over the Pareto-optimal decvar footprint by stratified-quantile
@@ -3542,43 +3533,26 @@ def infill_ftreat(archive_ft, train_ft=None, n_f=8, prev_res=None, alpha=0.6, be
     return np.interp(q, cdf, grid)
 
 
-def _lhs(n, bounds, rng):
-    """Latin-hypercube sample: n rows, one stratified column per (lo, hi) in bounds -- space-filling."""
-    d = len(bounds)
-    u = (np.arange(n)[:, None] + rng.random((n, d))) / n
-    for j in range(d):
-        rng.shuffle(u[:, j])
-    lo = np.array([b[0] for b in bounds], float)
-    hi = np.array([b[1] for b in bounds], float)
-    return lo + u * (hi - lo)
-
-
-def infill_points(archive, decvars, n_f, obj_col="cost", explore_bounds=None, explore_frac=0.5, seed=0):
-    """Multi-decvar infill: n_f decvar VECTORS to sample with the FOM, split EXPLOIT + EXPLORE so the
-    wave is diverse in the full decvar space (not just the -- possibly collapsed -- current front):
-
-      * EXPLOIT (1-explore_frac): Pareto-optimal combos from the archive, spread across the objective
-        front (obj_col=cost) -- refines the decision-relevant region;
-      * EXPLORE (explore_frac): a Latin-hypercube over the full decvar bounds (explore_bounds, a dict
-        decvar->(lo,hi)) -- space-filling coverage so the DSI learns the forecast response across the
-        WHOLE screen-config space (free knobs the front alone never samples).
-
-    Always returns exactly n_f rows (tops up with explore if the archive is tiny/empty), so a thinned
-    archive still yields a full pool-filling wave. explore_bounds=None -> exploit only (legacy)."""
+def infill_points(archive, decvars, n_runs, obj_col="cost"):
+    """Sample n_runs decvar VECTORS spread ALONG the Pareto front (one per FOM run). The archive is
+    sorted by the objective (obj_col=cost); n_runs positions are laid evenly along it and each decvar
+    vector is linearly interpolated between the two bracketing members. The two EXTREME front individuals
+    (the endpoints in obj_col -- cheapest/highest-SO4 and most-treated/lowest-SO4) are ALWAYS included
+    exactly (they are the linspace endpoints). Interpolation makes it work whether the archive is larger
+    OR smaller than n_runs, and every run gets a UNIQUE decvar sample covering the whole front (paired 1:1
+    with a unique parameter realisation in build_infill_par_ensemble). Returns an (n_runs x n_dv) frame."""
     cols = [d for d in decvars if d in archive.columns]
     arc = archive.dropna(subset=[obj_col]).sort_values(obj_col).reset_index(drop=True)
-    n_explore = min(n_f, round(explore_frac * n_f)) if explore_bounds else 0
-    n_exploit = min(n_f - n_explore, len(arc))
-    parts = []
-    if n_exploit > 0:                                             # spread across the front
-        idx = np.linspace(0, len(arc) - 1, n_exploit).round().astype(int)
-        parts.append(arc.iloc[idx].loc[:, cols].reset_index(drop=True))
-    n_need = n_f - sum(len(p) for p in parts)
-    if n_need > 0 and explore_bounds:                            # space-filling LHS over the full decvar box
-        rng = np.random.default_rng(seed)
-        X = _lhs(n_need, [explore_bounds[d] for d in cols], rng)
-        parts.append(pd.DataFrame(X, columns=cols))
-    return pd.concat(parts, axis=0, ignore_index=True).iloc[:n_f].reset_index(drop=True)
+    V = arc[cols].to_numpy(dtype=float)                          # (M, n_dv), sorted along the front
+    M = V.shape[0]
+    if M == 1:
+        return pd.DataFrame(np.repeat(V, n_runs, axis=0), columns=cols)
+    pos = np.linspace(0.0, M - 1, n_runs)                        # endpoints 0 and M-1 = the two extremes
+    lo = np.floor(pos).astype(int)
+    hi = np.clip(lo + 1, 0, M - 1)
+    frac = (pos - lo)[:, None]
+    X = V[lo] * (1.0 - frac) + V[hi] * frac                      # interp the decvar vector along the front
+    return pd.DataFrame(X, columns=cols)
 
 
 def _fom_training_rows(master_dir, sweep_template=WS7_SWEEP, s3_template=WS3, index_prefix="i"):
@@ -3610,43 +3584,40 @@ def _fom_training_rows(master_dir, sweep_template=WS7_SWEEP, s3_template=WS3, in
     return out, fore
 
 
-def build_infill_par_ensemble(dv_points, K, iter_k, out_path, prior_pe_path=WS3 / "prior_pe.jcb",
+def build_infill_par_ensemble(dv_points, iter_k, out_path, prior_pe_path=WS3 / "prior_pe.jcb",
                               sweep_template=WS7_SWEEP, s3_template=WS3, seed=20260707):
-    """DISPERSED infill par ensemble: draw n_points*K DISTINCT prior_pe realizations (rotated by iter_k)
-    and give each decvar point its OWN fresh K-subset -- NO parameter realization is reused across decvar
-    points. This spreads the (parameter x decvar) samples widely over the joint space, so the data-space
-    DSI sees many distinct parameter draws rather than the same K repeated at every point (the old
-    paired-CRN design gave a clean per-decvar gradient but sampled only K parameter sets). Sampled without
-    replacement while the ensemble allows.
+    """1:1 infill par ensemble -- every FOM run pairs a UNIQUE parameter realisation with a UNIQUE decvar
+    sample. Draw len(dv_points) DISTINCT prior_pe reals (rotated by iter_k) and pair each, in order, with
+    one front decvar vector: run j = param idx[j] + dv_points[j]. No parameter and no decvar combo is
+    reused within the wave, so the (parameter x decvar) samples are maximally dispersed AND spread along
+    the whole front. Sampled without replacement while the ensemble allows.
 
-    ``dv_points`` : a DataFrame (n_points x n_decvars) of Pareto-optimal decvar combos (f_treat + any
-    per-screen toggles). Every listed decvar is injected per point; a scalar/array of f_treat is also
-    accepted (back-compat -> a single f_treat column)."""
+    ``dv_points`` : a DataFrame (n_runs x n_decvars) of front decvar vectors (f_treat + per-screen
+    toggles), one per FOM run; a scalar/array of f_treat is also accepted (back-compat)."""
     import pyemu
     pst_s3 = pyemu.Pst(str(Path(s3_template) / "pest.pst"))
     pst_sw = pyemu.Pst(str(Path(sweep_template) / "pest.pst"))
     if not isinstance(dv_points, pd.DataFrame):                 # back-compat: a list/array of f_treat locs
         dv_points = pd.DataFrame({"f_treat": np.asarray(dv_points, float)})
+    dv_points = dv_points.reset_index(drop=True)
     base = pyemu.ParameterEnsemble.from_binary(pst=pst_s3, filename=str(prior_pe_path))._df
-    n_pts = len(dv_points)
-    n_need = n_pts * K
+    n = len(dv_points)
     rng = np.random.default_rng(seed + iter_k)
-    # distinct param reals, one disjoint K-block per decvar point (no reuse across points)
-    idx = rng.choice(np.asarray(base.index), size=n_need, replace=(n_need > base.shape[0]))
+    idx = rng.choice(np.asarray(base.index), size=n, replace=(n > base.shape[0]))   # distinct param reals
     rows = []
-    for j, (_, dvrow) in enumerate(dv_points.reset_index(drop=True).iterrows()):
-        sub = base.loc[idx[j * K:(j + 1) * K]].copy()          # this point's OWN param subset
-        for dv, val in dvrow.items():                          # inject ALL decvars (f_treat + screens)
-            sub[dv] = float(val)
-        sub.index = [f"it{iter_k}_l{j}_r{ri}" for ri in range(sub.shape[0])]
-        rows.append(sub)
+    for j, (_, dvrow) in enumerate(dv_points.iterrows()):
+        r = base.loc[[idx[j]]].copy()                          # ONE unique param realisation
+        for dv, val in dvrow.items():                          # ONE unique decvar sample (f_treat + screens)
+            r[dv] = float(val)
+        r.index = [f"it{iter_k}_r{j}"]
+        rows.append(r)
     df = pd.concat(rows, axis=0).loc[:, list(pst_sw.par_names)]
     pe = pyemu.ParameterEnsemble(pst=pst_sw, df=df)
     pe.enforce()
     n_distinct = len(set(idx.tolist()))
     pe.to_binary(str(out_path))
-    print(f"  [infill_pe] iter {iter_k}: {n_pts} decvar points x {K} params = {pe.shape[0]} reals "
-          f"({n_distinct} distinct param draws, no reuse across points) -> {Path(out_path).name}")
+    print(f"  [infill_pe] iter {iter_k}: {n} FOM runs = {n} unique (param, decvar) pairs along the front "
+          f"({n_distinct} distinct param reals) -> {Path(out_path).name}")
     return pe
 
 
@@ -3720,7 +3691,7 @@ def _front_shift(arc, arc_prev, p95_col, npts=50):
     return float(np.max(np.abs(np.interp(grid, a["cost"], a[p95_col]) - np.interp(grid, b["cost"], b[p95_col]))))
 
 
-def run_dsivc_outer_loop(n_iters=10, gens_per_iter=50, mou_pop=100, explore_frac=0.5,
+def run_dsivc_outer_loop(n_iters=10, gens_per_iter=50, mou_pop=100,
                          num_workers=None, condor_kwargs=None, alpha=0.6, beta=3.0, conv_tol=1.0,
                          seed=20260707, loop_dir=WS7_LOOP, cleanup=True, save_pop_every=10, resume=True):
     """Iterative FOM-retrain outer loop (ADR-0003). Each iteration: run a short (gens_per_iter) MOU on
@@ -3745,10 +3716,10 @@ def run_dsivc_outer_loop(n_iters=10, gens_per_iter=50, mou_pop=100, explore_frac
     loop_dir.mkdir(exist_ok=True)
     if num_workers is None:
         num_workers = CONDOR_DEFAULTS["n_workers"] if _htcondor_available() else max(1, (os.cpu_count() or 2) - 1)
-    n_f, K = _infill_grid_size(num_workers)
+    n_runs = num_workers                                # one FOM run per worker = one unique (param, decvar) pair
     P95 = "fore_peak_so4_stat:95%"
-    print(f"[outer_loop] {n_iters} iters max, {gens_per_iter}-gen MOU each, wave = {n_f} decvar points x {K} "
-          f"params ({n_f * K} FOM/iter), early-stop at front shift < {conv_tol} mg/L")
+    print(f"[outer_loop] {n_iters} iters max, {gens_per_iter}-gen MOU each, wave = {n_runs} unique "
+          f"(param, decvar) FOM runs along the front, early-stop at front shift < {conv_tol} mg/L")
 
     # base training = the sweep-only FOM set (ground truth backdrop, iteration -1)
     train, _fore = _fom_training_rows(WS7_SWEEP_MASTER, index_prefix="s")
@@ -3788,20 +3759,17 @@ def run_dsivc_outer_loop(n_iters=10, gens_per_iter=50, mou_pop=100, explore_frac
         run_dsivc_mou(dsivc_template=tdir, master_dir=mdir, num_workers=num_workers, condor_kwargs=condor_kwargs)
         arc = _pl.load_archive(str(mdir))
 
-        # 2-3. infill: n_f DECVAR VECTORS, EXPLOIT (Pareto front, spread across cost) + EXPLORE (LHS over
-        #      the full decvar box) so the FOM wave stays diverse in the whole screen-config space even
-        #      when the front thins. Read the full archive dv_pop (all decvars) + cost for the ordering.
+        # 2-3. infill: n_runs decvar VECTORS spread ALONG the Pareto front (extremes always included),
+        #      one per FOM run. Read the full archive dv_pop (all decvars) + cost for the front ordering.
         decvars = ["f_treat"] + [d for d in SCREEN_DVS if d in train.columns]
         dvpop = pd.read_csv(mdir / "dsivc.archive.dv_pop.csv").set_index("real_name")
         obpop = pd.read_csv(mdir / "dsivc.archive.obs_pop.csv").set_index("real_name")
         front = dvpop.join(obpop["cost"])
-        ebounds = {d: (0.0, F_TREAT_BOUNDS[1]) if d == "f_treat" else (0.0, 1.0) for d in decvars}
-        dv_points = infill_points(front, decvars, n_f, obj_col="cost", explore_bounds=ebounds,
-                                  explore_frac=explore_frac, seed=seed + k)
+        dv_points = infill_points(front, decvars, n_runs, obj_col="cost")
 
-        # 4-5. paired-CRN FOM wave at those decvar combos
+        # 4-5. FOM wave -- each run a UNIQUE (param realisation, front decvar) pair
         pe_path = it / "infill_pe.jcb"
-        build_infill_par_ensemble(dv_points, K, k, pe_path, seed=seed)
+        build_infill_par_ensemble(dv_points, k, pe_path, seed=seed + k)
         run_fom_infill(pe_path, it / "infill_master", num_workers, condor_kwargs=condor_kwargs)
 
         # 6. extract + accumulate (rows carry f_treat + screen decvars + forecast)
