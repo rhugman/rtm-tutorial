@@ -3691,7 +3691,7 @@ def _front_shift(arc, arc_prev, p95_col, npts=50):
     return float(np.max(np.abs(np.interp(grid, a["cost"], a[p95_col]) - np.interp(grid, b["cost"], b[p95_col]))))
 
 
-def run_dsivc_outer_loop(n_iters=10, gens_per_iter=50, mou_pop=100,
+def run_dsivc_outer_loop(n_iters=10, gens_per_iter=20, mou_pop=100,
                          num_workers=None, condor_kwargs=None, alpha=0.6, beta=3.0, conv_tol=1.0,
                          seed=20260707, loop_dir=WS7_LOOP, cleanup=True, save_pop_every=10, resume=True):
     """Iterative FOM-retrain outer loop (ADR-0003). Each iteration: run a short (gens_per_iter) MOU on
