@@ -616,8 +616,76 @@ def fig_screen_front(dsivc_master):
     return savefig(fig, "screen_front", STAGE)
 
 
+def fig_final_validation(vdir, out=None):
+    """FINAL VALIDATION figure (post-loop): does the emulated (DSIVC) forecast hold up under the FULL
+    model at the Pareto-optimal decvars? Reads val_summary.csv (per-point emu stack stats + full-model
+    percentiles), val_fom_dist.csv (the full FOM forecast per point), val_front.csv (emulated backdrop).
+      (a) emulated vs full-model P95 (the objective) along the cost front -- the decision-relevant check;
+      (b) per optimum: full-model forecast DISTRIBUTION (violin) vs emulated P5-P95 stack (box)."""
+    from matplotlib.patches import Rectangle, Patch
+    apply_style()
+    vdir = Path(vdir)
+    summ = pd.read_csv(vdir / "val_summary.csv").set_index("point").sort_values("cost")
+    dist = pd.read_csv(vdir / "val_fom_dist.csv")
+    front = pd.read_csv(vdir / "val_front.csv") if (vdir / "val_front.csv").exists() else None
+    pts = list(summ.index)
+    fig, (a0, a1) = plt.subplots(1, 2, figsize=(13, 5.4))
+
+    # (a) emulated vs full-model P95 along the cost front
+    if front is not None:
+        a0.plot(front["cost"], front["emu_p95"], color=ROLE["emulated"], lw=1.4, alpha=0.5, zorder=2,
+                label="emulated front (P95)")
+    for _, r in summ.iterrows():
+        a0.plot([r["cost"], r["cost"]], [r["emu_95%"], r["fom_95%"]], color="0.45", lw=1.0, zorder=4)
+    a0.scatter(summ["cost"], summ["emu_95%"], s=60, color=ROLE["emulated"], edgecolor="k", lw=0.6,
+               zorder=5, label="emulated P95 @ optimum")
+    a0.scatter(summ["cost"], summ["fom_95%"], s=72, marker="D", color=ROLE["posterior"], edgecolor="k",
+               lw=0.6, zorder=6, label="full-model P95 (validation)")
+    a0.set_xlabel(LBL["cost"])
+    a0.set_ylabel("P95 peak SO$_4$ (mg/L)")
+    a0.set_title("(a) emulated vs full-model P95 along the front")
+    a0.legend(fontsize=8, loc="best")
+
+    # (b) per-point forecast distributions: full-model violin vs emulated stack box
+    xs = np.arange(len(pts))
+    data = [dist.loc[dist["point"] == p, "peak_so4"].values for p in pts]
+    if any(len(d) for d in data):
+        parts = a1.violinplot([d for d in data if len(d)],
+                              positions=[xs[i] - 0.16 for i, d in enumerate(data) if len(d)],
+                              widths=0.28, showextrema=False)
+        for b in parts["bodies"]:
+            b.set_facecolor(ROLE["posterior"]); b.set_alpha(0.35); b.set_edgecolor(ROLE["posterior"])
+    a1.scatter(xs - 0.16, summ["fom_95%"].values, s=26, color=ROLE["posterior"], edgecolor="k",
+               lw=0.5, zorder=6)
+    for i, p in enumerate(pts):                                  # emulated stack: min-max whisker, P5-P95 box, mean, P95
+        r = summ.loc[p]
+        x = xs[i] + 0.16
+        a1.plot([x, x], [r["emu_min"], r["emu_max"]], color=ROLE["emulated"], lw=1.0, zorder=5)
+        a1.add_patch(Rectangle((x - 0.08, r["emu_5%"]), 0.16, r["emu_95%"] - r["emu_5%"],
+                               facecolor=ROLE["emulated"], alpha=0.35, edgecolor=ROLE["emulated"], zorder=5))
+        a1.plot([x - 0.08, x + 0.08], [r["emu_mean"]] * 2, color=ROLE["emulated"], lw=1.4, zorder=6)
+        a1.scatter([x], [r["emu_95%"]], s=26, color=ROLE["emulated"], edgecolor="k", lw=0.5, zorder=7)
+    a1.set_xticks(xs)
+    a1.set_xticklabels([f"cost\n{summ.loc[p, 'cost']:.2f}" for p in pts], fontsize=8)
+    a1.set_ylabel("peak SO$_4$ (mg/L)")
+    a1.set_title("(b) full-model forecast (violin) vs emulated stack (box) per optimum")
+    a1.legend(handles=[Patch(facecolor=ROLE["posterior"], alpha=0.35, label="full-model dist. (P95 = dot)"),
+                       Patch(facecolor=ROLE["emulated"], alpha=0.35, label="emulated P5–P95 (P95 = dot, mean = bar)")],
+              fontsize=8, loc="best")
+    fig.suptitle("Final validation: DSIVC-optimal decvars run through the full FOM parameter ensemble",
+                 fontweight="bold")
+    fig.tight_layout(rect=[0, 0, 1, 0.96])
+    if out is not None:
+        fig.savefig(str(out)); plt.close(fig); print(f"  [fig] {out}"); return Path(out)
+    return savefig(fig, "final_validation", STAGE)
+
+
 if __name__ == "__main__":
     base = Path(__file__).parent
+    if "--validate" in sys.argv:
+        vd = base / "_s7_loop" / "validation"
+        print(f"[plot_dsivc] wrote {fig_final_validation(vd)}")
+        sys.exit(0)
     if "--screens" in sys.argv:
         print(f"[plot_dsivc] wrote {fig_screen_effect(base / '_s7_sweep_master', base / '_s7_sweep_template')}")
         md = base / "_s7_dsivc_master"

@@ -3981,6 +3981,150 @@ def run_dsivc_outer_loop(n_iters=100, gens_per_iter=50, mou_pop=100, wave_size=5
     return train, prev_arc
 
 
+def _pick_front_members(front, n, obj_cols):
+    """Pick n ACTUAL Pareto-optimal members (real_names) evenly spaced by ARC LENGTH in normalized
+    objective space (obj_cols, e.g. cost + P95-SO4). Unlike infill_points -- which INTERPOLATES decvar
+    vectors -- validation must run REAL optimal decvar combos, so this returns existing archive rows. The
+    two extremes (arc endpoints) are always included; duplicates (small/clustered archives) are collapsed."""
+    ocols = [c for c in obj_cols if c in front.columns]
+    arc = front.dropna(subset=ocols).sort_values(ocols)
+    if arc.shape[0] <= n:
+        return list(arc.index)
+    O = arc[ocols].to_numpy(float)
+    span = O.max(0) - O.min(0)
+    span[span == 0] = 1.0
+    On = (O - O.min(0)) / span
+    s = np.concatenate([[0.0], np.cumsum(np.sqrt(((On[1:] - On[:-1]) ** 2).sum(1)))])
+    L = s[-1]
+    if L == 0:
+        return list(arc.index[:n])
+    tgt = np.linspace(0.0, L, n)
+    out, seen = [], set()
+    for t in tgt:                                              # nearest actual member to each even arc position
+        i = int(np.argmin(np.abs(s - t)))
+        if i not in seen:
+            seen.add(i)
+            out.append(arc.index[i])
+    return out
+
+
+def build_validation_par_ensemble(dv_points, out_path, source_pe_path=None,
+                                  sweep_template=WS7_SWEEP, s3_template=WS3, fom_master=WS_FOM_MASTER):
+    """Validation ensemble: each Pareto-optimal decvar vector run against the ENTIRE FOM posterior
+    parameter ensemble (NOT a 1:1 subset like the infill) -> one full-model forecast DISTRIBUTION per
+    front point. Run index 'pt{p}_r{i}' encodes (front point p, posterior real i) so the wave can be
+    split back per point. ``source_pe_path`` overrides the auto-located FOM posterior."""
+    import pyemu
+    pst_s3 = pyemu.Pst(str(Path(s3_template) / "pest.pst"))
+    pst_sw = pyemu.Pst(str(Path(sweep_template) / "pest.pst"))
+    dv_points = dv_points.reset_index(drop=True)
+    if source_pe_path is None:
+        source_pe_path = fom_posterior_pe_path(fom_master)
+    base = pyemu.ParameterEnsemble.from_binary(pst=pst_s3, filename=str(source_pe_path))._df
+    rows = []
+    for p, (_, dvrow) in enumerate(dv_points.iterrows()):
+        blk = base.copy()                                     # FULL posterior at this front point's decvars
+        for dv, val in dvrow.items():
+            blk[dv] = float(val)
+        blk.index = [f"pt{p}_r{i}" for i in range(blk.shape[0])]
+        rows.append(blk)
+    df = pd.concat(rows, axis=0).loc[:, list(pst_sw.par_names)]
+    pe = pyemu.ParameterEnsemble(pst=pst_sw, df=df)
+    pe.enforce()
+    pe.to_binary(str(out_path))
+    print(f"  [val_pe] {len(dv_points)} front points x {base.shape[0]} FOM-posterior reals "
+          f"= {pe.shape[0]} full-model runs -> {Path(out_path).name}")
+    return pe
+
+
+def _val_forecast_by_point(master_dir, sweep_template=WS7_SWEEP, s3_template=WS3):
+    """Split a validation FOM wave's peak-SO4 forecast back per front point -> {p: np.array of peaks}
+    (same forecast definition as _fom_training_rows: max over the Section-3 forecast obs group)."""
+    import pyemu
+    pst_sw = pyemu.Pst(str(Path(sweep_template) / "pest.pst"))
+    pst_sw.try_parse_name_metadata()
+    pst_s3 = pyemu.Pst(str(Path(s3_template) / "pest.pst"))
+    oe = pyemu.ObservationEnsemble.from_binary(pst=pst_sw, filename=str(Path(master_dir) / "pest.0.obs.jcb"))
+    df = pd.DataFrame(oe.values, index=oe.index.astype(str), columns=[c.lower() for c in oe.columns])
+    keep = [c.lower() for c in _dsi_keepobs(pst_s3)]
+    fore = [c for c in keep if pst_s3.observation_data.loc[c, "obgnme"] == "forecast"]
+    peak = df.loc[:, fore].max(axis=1)
+    out = {}
+    for idx, v in peak.items():
+        p = int(str(idx).split("_")[0][2:])                   # 'pt3_r17' -> 3
+        out.setdefault(p, []).append(float(v))
+    return {p: np.asarray(v) for p, v in sorted(out.items())}
+
+
+def run_final_validation(n_points=5, loop_dir=WS7_LOOP, num_workers=None, condor_kwargs=None,
+                         s3_template=WS3, sweep_template=WS7_SWEEP, fom_master=WS_FOM_MASTER):
+    """FINAL VALIDATION (post-loop, ADR-0003). Pick ``n_points`` Pareto-optimal decvar vectors evenly
+    spaced by arc length along the FINAL DSIVC front, run each against the ENTIRE FOM posterior parameter
+    ensemble (the true full-model forecast distribution per point), and compare the emulated (DSIVC)
+    P5/mean/P95 stack against the full model. This closes the emulation-first loop: does the optimized
+    front hold up under the real model at the decision-relevant optima? Writes val_summary.csv +
+    val_fom_dist.csv + val_front.csv under loop_dir/validation and the comparison figure."""
+    import os
+    import plot_dsivc as _pl
+    loop_dir = Path(loop_dir)
+    if num_workers is None:
+        num_workers = CONDOR_DEFAULTS["n_workers"] if _htcondor_available() else max(1, (os.cpu_count() or 2) - 1)
+    P95 = "fore_peak_so4_stat:95%"
+    STAT = {"min": "fore_peak_so4_stat:min", "5%": "fore_peak_so4_stat:5%", "mean": "fore_peak_so4_stat:mean",
+            "95%": "fore_peak_so4_stat:95%", "max": "fore_peak_so4_stat:max"}
+
+    # final front = the last completed iteration's archive
+    iters = sorted(p for p in loop_dir.glob("iter*") if (p / "master" / "dsivc.archive.obs_pop.csv").exists())
+    if not iters:
+        raise FileNotFoundError(f"[validation] no completed loop iteration with an archive under {loop_dir}")
+    final_master = iters[-1] / "master"
+    dvpop = pd.read_csv(final_master / "dsivc.archive.dv_pop.csv").set_index("real_name")
+    obpop = pd.read_csv(final_master / "dsivc.archive.obs_pop.csv").set_index("real_name")
+    decvars = ["f_treat"] + [d for d in SCREEN_DVS if d in dvpop.columns]
+    front = dvpop.join(obpop[[c for c in ("cost", P95) if c in obpop.columns]]).dropna(subset=["cost", P95])
+    sel = _pick_front_members(front, n_points, ("cost", P95))
+    dv_points = front.loc[sel, decvars].reset_index(drop=True)
+    print(f"[validation] final front from {final_master} ({front.shape[0]} members); "
+          f"{len(sel)} optimal decvars x FULL FOM posterior")
+
+    vdir = loop_dir / "validation"
+    vdir.mkdir(exist_ok=True)
+    pe_path = vdir / "val_pe.jcb"
+    build_validation_par_ensemble(dv_points, pe_path, s3_template=s3_template,
+                                  sweep_template=sweep_template, fom_master=fom_master)
+    run_fom_infill(pe_path, vdir / "val_master", num_workers, template_ws=sweep_template,
+                   condor_kwargs=condor_kwargs)
+    fom = _val_forecast_by_point(vdir / "val_master", sweep_template, s3_template)
+
+    # per-point summary: emulated (DSIVC stack stats) vs full-model forecast percentiles
+    recs = []
+    for p, rn in enumerate(sel):
+        fp = fom.get(p, np.asarray([]))
+        rec = {"point": p, "real_name": rn, "cost": float(front.loc[rn, "cost"]),
+               "f_treat": float(front.loc[rn, "f_treat"])}
+        for k, col in STAT.items():
+            rec[f"emu_{k}"] = float(obpop.loc[rn, col]) if col in obpop.columns else np.nan
+        if fp.size:
+            rec.update({"fom_min": float(fp.min()), "fom_5%": float(np.percentile(fp, 5)),
+                        "fom_mean": float(fp.mean()), "fom_95%": float(np.percentile(fp, 95)),
+                        "fom_max": float(fp.max()), "fom_n": int(fp.size)})
+        recs.append(rec)
+    summary = pd.DataFrame(recs).set_index("point")
+    summary.to_csv(vdir / "val_summary.csv")
+    pd.DataFrame([(p, v) for p, arr in fom.items() for v in arr],
+                 columns=["point", "peak_so4"]).to_csv(vdir / "val_fom_dist.csv", index=False)
+    front[["cost", P95]].rename(columns={P95: "emu_p95"}).sort_values("cost").to_csv(
+        vdir / "val_front.csv", index=False)
+
+    if {"emu_95%", "fom_95%"}.issubset(summary.columns):
+        err = (summary["emu_95%"] - summary["fom_95%"]).abs()
+        print(f"[validation] emulated vs full-model P95: mean|Δ|={err.mean():.2f} mg/L, "
+              f"max|Δ|={err.max():.2f} mg/L over {err.notna().sum()} pts")
+    _pl.fig_final_validation(vdir)
+    print(f"[validation] done -> {vdir}")
+    return summary
+
+
 def stage7_dsivc(num_workers=None, condor_kwargs=None):
     """Section-7 orchestrator (draft): build sweep interface -> reuse-120 sweep ensemble -> run sweep ->
     merge with the prior MC -> build DSIVC. Requires the Section-5 prior MC (_s5_master) already landed.
@@ -4041,6 +4185,9 @@ def run_all(num_reals=N_PRIOR_MC, num_workers=None, condor_kwargs=None, quantile
           lambda: stage7_dsivc(num_workers=num_workers, condor_kwargs=condor_kwargs))
     _step("stage 8 -- DSIVC outer loop (iterative FOM-retrain)", WS7_LOOP / "train_final.csv",
           lambda: run_dsivc_outer_loop(num_workers=num_workers, condor_kwargs=condor_kwargs, resume=not force))
+    _step("stage 9 -- final validation (optimal decvars x full FOM ensemble)",
+          WS7_LOOP / "validation" / "val_summary.csv",
+          lambda: run_final_validation(num_workers=num_workers, condor_kwargs=condor_kwargs))
     print(f"\n{'=' * 72}\n[run_all] DONE -- full DIZON arc complete\n{'=' * 72}", flush=True)
 
 
@@ -4070,6 +4217,15 @@ if __name__ == "__main__":
         run_dsivc_outer_loop(n_iters=_ni, resume="--fresh" not in sys.argv)
     elif "--stage7" in sys.argv:
         stage7_dsivc()
+    elif "--validate" in sys.argv or "--stage9val" in sys.argv:   # FINAL VALIDATION: optimal decvars x full FOM ensemble
+        _npts = 5
+        for a in sys.argv:
+            if a.startswith("--points="):
+                _npts = int(a.split("=")[1])
+        run_final_validation(n_points=_npts)
+    elif "--stage9figs" in sys.argv:                          # re-plot validation from persisted csvs (no FOM re-run)
+        import plot_dsivc as _pl
+        _pl.fig_final_validation(WS7_LOOP / "validation")
     elif "--reinflate" in sys.argv:                          # test reinflation on failed LOO xvals
         reinflate_test()
     elif "--regen" in sys.argv:                              # regenerate all stage5/6 figs (corrected LOO)
