@@ -3965,10 +3965,12 @@ def stage7_dsivc(num_workers=None, condor_kwargs=None):
 
 
 def run_all(num_reals=N_PRIOR_MC, num_workers=None, condor_kwargs=None, quantile=0.75, force=False):
-    """ONE-SHOT DRIVER (``--all``): run the whole DIZON arc, stages 2 -> 7, in order, NO STOPS. Each
-    stage writes the workspace the next consumes (mothership pattern). The heavy stages (prior MC,
-    full-model IES history match, DSIVC sweep) auto-deploy to HTCondor when a pool is reachable, else
-    to local PANTHER workers -- so this same command scales from a laptop to a cluster.
+    """ONE-SHOT DRIVER (``--all``): run the whole DIZON arc, stages 2 -> 8, in order, NO STOPS -- ending
+    with the DSIVC outer loop (iterative FOM-retrain). Each stage writes the workspace the next consumes
+    (mothership pattern). The heavy stages (prior MC, full-model IES history match, DSIVC sweep, the
+    outer-loop FOM waves) auto-deploy to HTCondor when a pool is reachable, else to local PANTHER workers
+    -- so this same command scales from a laptop to a cluster. NOTE: stage 8 is the 100-iteration loop,
+    so --all is a very long run; run `--stage7loop` on its own if you want just the loop.
 
     RESUME (default): each stage is SKIPPED if its completion artifact already exists, so a re-run
     continues from where it stopped rather than redoing hours of full-model runs. ``force=True``
@@ -4002,8 +4004,10 @@ def run_all(num_reals=N_PRIOR_MC, num_workers=None, condor_kwargs=None, quantile
     # parameter ensemble from the FOM POSTERIOR (history-matched), so it must run BEFORE stage 7.
     _step("stage 6-FOM -- full-model IES history match", WS_FOM_MASTER / "pest.1.par.jcb",
           lambda: stage6_fom(num_workers=num_workers, condor_kwargs=condor_kwargs))
-    _step("stage 7 -- DSIVC sweep (FOM-posterior params) + merge + optimizer", WS7_SWEEP_MASTER / "pest.0.obs.jcb",
+    _step("stage 7 -- DSIVC sweep (FOM-posterior params) + merge + single DSIVC", WS7_SWEEP_MASTER / "pest.0.obs.jcb",
           lambda: stage7_dsivc(num_workers=num_workers, condor_kwargs=condor_kwargs))
+    _step("stage 8 -- DSIVC outer loop (iterative FOM-retrain)", WS7_LOOP / "train_final.csv",
+          lambda: run_dsivc_outer_loop(num_workers=num_workers, condor_kwargs=condor_kwargs, resume=not force))
     print(f"\n{'=' * 72}\n[run_all] DONE -- full DIZON arc complete\n{'=' * 72}", flush=True)
 
 
