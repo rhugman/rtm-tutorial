@@ -2937,6 +2937,106 @@ def stage6_fom(num_workers=None, condor_kwargs=None):
     return WS_FOM_MASTER
 
 
+def _forecast_cols(s3_template=WS3):
+    """The recovered-SO4 forecast obs names (obgnme='forecast'), lowercased, from the Section-3 pst --
+    the canonical forecast group shared by the DSI, FOM and sweep interfaces."""
+    import pyemu
+    p3 = pyemu.Pst(str(Path(s3_template) / "pest.pst"))
+    o = p3.observation_data
+    return [str(x).lower() for x in o.index if o.loc[x, "obgnme"] == "forecast"]
+
+
+def _peak_forecast_from_jcb(pst, jcb, fore_lower):
+    """Peak recovered-SO4 per realization = max over the forecast obs of an obs ensemble jcb (columns
+    lowercased for a case-robust match against ``fore_lower``)."""
+    import pyemu
+    oe = pyemu.ObservationEnsemble.from_binary(pst=pst, filename=str(jcb))
+    df = pd.DataFrame(oe.values, index=oe.index.astype(str), columns=[c.lower() for c in oe.columns])
+    cols = [c for c in fore_lower if c in df.columns]
+    if not cols:
+        raise KeyError(f"no forecast obs matched in {jcb}")
+    return df.loc[:, cols].max(axis=1).values
+
+
+def fom_posterior_forecast(fom_master=WS_FOM_MASTER, fom_template=WS_FOM, s3_template=WS3, noptmax=1):
+    """Peak recovered-SO4 per FULL-MODEL IES POSTERIOR realization -- max over the forecast obs of the
+    last-iteration obs ensemble (pest.<N>.obs.jcb) in the FOM history-match master."""
+    import pyemu
+    avail = [i for i in range(noptmax + 1) if (Path(fom_master) / f"pest.{i}.obs.jcb").exists()]
+    if not avail:
+        raise FileNotFoundError(f"no FOM obs ensemble (pest.<N>.obs.jcb) in {fom_master} -- run stage6_fom")
+    fpst = pyemu.Pst(str(Path(fom_template) / "pest.pst"))
+    return _peak_forecast_from_jcb(fpst, Path(fom_master) / f"pest.{max(avail)}.obs.jcb", _forecast_cols(s3_template))
+
+
+def _fig_fom_vs_dsi(prior_fc, dsi_post, fom_post, truth_fc, stage="06_dsi"):
+    """Validation figure: the FULL-MODEL IES posterior (gold standard) vs the DSI-emulator posterior of
+    peak recovered-SO4, both conditioned on the same synthetic truth, over the emulator prior + truth.
+    Hist (left) + CDF (right); a stats box compares P50 / P05-P95 / truth coverage."""
+    import matplotlib.pyplot as plt
+    apply_style()
+    prior_fc = np.asarray(prior_fc, float)
+    dsi_post = np.asarray(dsi_post, float)
+    fom_post = np.asarray(fom_post, float)
+    c_prior, c_fom, c_dsi = ROLE["prior"], ROLE["posterior"], ROLE["emulated"]
+
+    fig, (a0, a1) = plt.subplots(1, 2, figsize=(12, 5))
+    a0.hist(prior_fc, bins=30, color=c_prior, alpha=0.4, density=True, label="emulator prior")
+    a0.hist(fom_post, bins=30, color=c_fom, alpha=0.5, density=True, label="FOM posterior (full model)")
+    a0.hist(dsi_post, bins=30, color=c_dsi, alpha=0.5, density=True, label="DSI posterior (emulator)")
+    a0.axvline(truth_fc, color=ROLE["truth"], lw=2.5, label=f"truth ({truth_fc:.1f})")
+    a0.set_xlabel("peak recovered SO$_4$ (mg/L)")
+    a0.set_ylabel("density")
+    a0.legend(fontsize=8, loc="upper right")
+    a0.set_title("Posterior forecast: FOM vs DSI emulator", fontsize=12)
+    xhi = float(np.percentile(np.concatenate([prior_fc, fom_post, dsi_post]), 99.5)) * 1.25
+    a0.set_xlim(0, xhi)
+
+    for arr, col, lab in [(prior_fc, c_prior, "prior"), (fom_post, c_fom, "FOM posterior"),
+                          (dsi_post, c_dsi, "DSI posterior")]:
+        s = np.sort(arr)
+        a1.plot(s, np.linspace(0, 1, len(s)), color=col, lw=2, label=lab)
+    a1.axvline(truth_fc, color=ROLE["truth"], lw=2.5)
+    a1.set_xlabel("peak recovered SO$_4$ (mg/L)")
+    a1.set_ylabel("cumulative probability")
+    a1.set_xlim(0, xhi)
+    a1.legend(fontsize=8, loc="lower right")
+    a1.set_title("CDF", fontsize=12)
+
+    def _stat(a):
+        p5, p50, p95 = np.percentile(a, [5, 50, 95])
+        cov = "Y" if a.min() <= truth_fc <= a.max() else "N"
+        return f"P50 {p50:.1f}  [P5-95 {p5:.1f}-{p95:.1f}]  truth-cover {cov}"
+    a1.text(0.02, 0.98, f"FOM:  {_stat(fom_post)}\nDSI:  {_stat(dsi_post)}",
+            transform=a1.transAxes, va="top", ha="left", fontsize=7.5,
+            family="monospace", bbox=dict(boxstyle="round", fc="white", ec="0.7", alpha=0.9))
+
+    fig.suptitle(f"Full-model IES posterior vs DSI-emulator posterior "
+                 f"(peak recovered-SO$_4$; truth {truth_fc:.1f} mg/L)", fontweight="bold")
+    return savefig(fig, "fom_vs_dsi_posterior", stage)
+
+
+def fig_fom_vs_dsi_posterior(dsi_template=WS6_DSI, fom_master=WS_FOM_MASTER, fom_template=WS_FOM,
+                             s3_template=WS3, truth_dir=None, noptmax=1):
+    """Overlay the DSI-emulator posterior + the FULL-MODEL IES posterior of peak recovered-SO4 (both
+    conditioned on the same synthetic truth) -- the emulator-vs-gold-standard validation.
+
+    The forecast obs are taken by NAME from the canonical Section-3 forecast group (obgnme='forecast',
+    set at build time), matched case-robustly against each obs ensemble -- so it doesn't depend on how a
+    given interface tagged its obs groups. Truth peak from _truth/truth_meta.txt."""
+    import pyemu
+    truth_dir = Path(truth_dir) if truth_dir else (Path(__file__).parent / "_truth")
+    truth_fc = next(float(l.split("=")[1]) for l in (truth_dir / "truth_meta.txt").read_text().splitlines()
+                    if "peak" in l and "=" in l)
+    fore = _forecast_cols(s3_template)
+    dpst = pyemu.Pst(str(Path(dsi_template) / "dsi.pst"))
+    dsi_last = max(i for i in range(noptmax + 1) if (Path(dsi_template) / f"dsi.{i}.obs.jcb").exists())
+    prior_fc = _peak_forecast_from_jcb(dpst, Path(dsi_template) / "dsi.0.obs.jcb", fore)
+    dsi_post = _peak_forecast_from_jcb(dpst, Path(dsi_template) / f"dsi.{dsi_last}.obs.jcb", fore)
+    fom_post = fom_posterior_forecast(fom_master, fom_template, s3_template=s3_template, noptmax=noptmax)
+    return _fig_fom_vs_dsi(prior_fc, dsi_post, fom_post, truth_fc)
+
+
 def dsi_posterior(dsi_template=WS6_DSI, forecast_cols=None, truth=None, noptmax=1):
     """Prior (iter 0) and posterior (last iter) recovered-SO4 forecast from the DSI obs ensembles."""
     import pyemu
@@ -3949,6 +4049,8 @@ if __name__ == "__main__":
         regen_figs()                                         #   (same as run_all's stage 6, not truth_real=5)
     elif "--stage6fom" in sys.argv:                          # FULL-MODEL IES history match (DSI comparison)
         stage6_fom()
+    elif "--fomvsdsi" in sys.argv:                           # FOM-posterior vs DSI-emulator posterior figure
+        print(f"[fomvsdsi] wrote {fig_fom_vs_dsi_posterior()}")
     elif "--stage5" in sys.argv:
         stage5_prior_mc()                                    # N_PRIOR_MC reals (same as run_all)
     elif "--stage4" in sys.argv:                             # lock truth + inject weights (after prior MC)
