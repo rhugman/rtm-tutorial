@@ -4057,5 +4057,13 @@ if __name__ == "__main__":
         stage4_truth_weights()
     elif "--stage3" in sys.argv:
         stage3_pstfrom()
-    else:                                                    # stage 2: build + RUN the model (as run_all does)
+    else:
+        # stage 2 (build + RUN the model) is the DEFAULT only for a bare call or the stage-2 modifiers.
+        # An UNRECOGNIZED flag must NOT silently fall through to a model run (e.g. a --stageN typo, or a
+        # newer flag like --fomvsdsi on an un-pulled checkout).
+        _mods = {"--stage2", "--build", "--run", "--rebuild"}
+        _unknown = [a for a in sys.argv[1:] if a.startswith("--") and a not in _mods]
+        if _unknown:
+            sys.exit(f"[workflow] unrecognized option(s): {' '.join(_unknown)} -- no stage matched, "
+                     f"NOT running the model. Check the flag (and 'git pull' if it is new).")
         stage2_build(rebuild=_rebuild, run_model=True)
