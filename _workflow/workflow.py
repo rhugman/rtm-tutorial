@@ -3721,15 +3721,47 @@ def _fom_training_rows(master_dir, sweep_template=WS7_SWEEP, s3_template=WS3, in
     return out, fore
 
 
+def _param_queue_draw(index, iter_k, n, seed):
+    """ACROSS-WAVE without-replacement parameter draw -- a single persistent shuffle-bag of the FOM-posterior
+    members, consumed n-per-wave and reshuffled only when the bag empties, so EVERY posterior realisation is
+    FOM-evaluated once before ANY is repeated (max diversity). This replaces the old per-wave INDEPENDENT
+    draw (``default_rng(seed+iter_k).choice``), which -- being reseeded each wave -- reused some members
+    across waves while never touching others. The n members of a single wave are still DISTINCT: a wave that
+    empties the bag mid-draw refills from a fresh shuffle that EXCLUDES the members already placed in that
+    wave (holds while n <= ensemble size). Deterministic in (seed, iter_k, n, members): the whole
+    consumption from iter 0..iter_k is replayed from a fixed seed each call, so it is reproducible and
+    RESUME-SAFE with no stored cursor. Falls back to a with-replacement draw if a wave exceeds the ensemble."""
+    members = list(np.asarray(index))
+    N = len(members)
+    if n > N:                                                   # wave bigger than the ensemble: can't be unique
+        return np.random.default_rng([int(seed), int(iter_k)]).choice(members, size=n, replace=True)
+
+    def shuffled(epoch):                                        # deterministic per-epoch reshuffle
+        return [members[i] for i in np.random.default_rng([int(seed), int(epoch)]).permutation(N)]
+
+    bag, epoch, wave = shuffled(0), 0, None
+    for _ in range(iter_k + 1):                                 # replay iter 0..iter_k (bag/epoch carry across waves)
+        wave, seen = [], set()
+        while len(wave) < n:
+            if not bag:                                         # bag empty mid-wave -> next epoch, keep wave distinct
+                epoch += 1
+                bag = [m for m in shuffled(epoch) if m not in seen]
+            m = bag.pop(0)
+            seen.add(m)
+            wave.append(m)
+    return np.asarray(wave, dtype=object)
+
+
 def build_infill_par_ensemble(dv_points, iter_k, out_path, source_pe_path=None,
                               sweep_template=WS7_SWEEP, s3_template=WS3, seed=20260707,
                               fom_master=WS_FOM_MASTER):
     """1:1 infill par ensemble -- every FOM run pairs a UNIQUE parameter realisation with a UNIQUE decvar
-    sample. Draw len(dv_points) DISTINCT parameter reals from the FOM POSTERIOR (rotated by iter_k) and
-    pair each, in order, with one front decvar vector: run j = param idx[j] + dv_points[j]. Using the same
-    history-matched posterior as the sweep keeps the whole training set on one consistent parameter
-    baseline. No parameter and no decvar combo is reused within the wave; sampled without replacement
-    while the ensemble allows. ``source_pe_path`` overrides the auto-located FOM posterior.
+    sample. Draw len(dv_points) parameter reals from the FOM POSTERIOR via a persistent ACROSS-WAVE
+    shuffle-bag (``_param_queue_draw``) -- so every posterior member is used once before any repeats (max
+    diversity across the whole loop, not just within one wave) -- and pair each, in order, with one front
+    decvar vector: run j = param idx[j] + dv_points[j]. Using the same history-matched posterior as the
+    sweep keeps the whole training set on one consistent parameter baseline. No parameter and no decvar is
+    reused within a wave. ``source_pe_path`` overrides the auto-located FOM posterior.
 
     ``dv_points`` : a DataFrame (n_runs x n_decvars) of front decvar vectors (f_treat + per-screen
     toggles), one per FOM run; a scalar/array of f_treat is also accepted (back-compat)."""
@@ -3743,8 +3775,7 @@ def build_infill_par_ensemble(dv_points, iter_k, out_path, source_pe_path=None,
         source_pe_path = fom_posterior_pe_path(fom_master)
     base = pyemu.ParameterEnsemble.from_binary(pst=pst_s3, filename=str(source_pe_path))._df
     n = len(dv_points)
-    rng = np.random.default_rng(seed + iter_k)
-    idx = rng.choice(np.asarray(base.index), size=n, replace=(n > base.shape[0]))   # distinct param reals
+    idx = _param_queue_draw(base.index, iter_k, n, seed)        # across-wave WITHOUT replacement (max diversity)
     rows = []
     for j, (_, dvrow) in enumerate(dv_points.iterrows()):
         r = base.loc[[idx[j]]].copy()                          # ONE unique param realisation
@@ -3756,9 +3787,11 @@ def build_infill_par_ensemble(dv_points, iter_k, out_path, source_pe_path=None,
     pe = pyemu.ParameterEnsemble(pst=pst_sw, df=df)
     pe.enforce()
     n_distinct = len(set(idx.tolist()))
+    n_used = min((iter_k + 1) * n, base.shape[0])              # cumulative queue coverage (before wrap)
     pe.to_binary(str(out_path))
     print(f"  [infill_pe] iter {iter_k}: {n} FOM runs = {n} unique (param, decvar) pairs along the front "
-          f"({n_distinct} distinct param reals) -> {Path(out_path).name}")
+          f"({n_distinct} distinct params this wave; ~{n_used}/{base.shape[0]} of the posterior queue "
+          f"consumed) -> {Path(out_path).name}")
     return pe
 
 
@@ -3913,7 +3946,7 @@ def run_dsivc_outer_loop(n_iters=100, gens_per_iter=50, mou_pop=100, wave_size=5
 
         # 4-5. FOM wave -- each run a UNIQUE (param realisation, front decvar) pair
         pe_path = it / "infill_pe.jcb"
-        build_infill_par_ensemble(dv_points, k, pe_path, seed=seed + k)
+        build_infill_par_ensemble(dv_points, k, pe_path, seed=seed)   # stable seed: the queue positions by iter_k
         run_fom_infill(pe_path, it / "infill_master", num_workers, condor_kwargs=condor_kwargs)
 
         # 6. extract + accumulate (rows carry f_treat + screen decvars + forecast)
